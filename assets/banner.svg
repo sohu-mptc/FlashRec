@@ -57,5 +57,5 @@
 
   <!-- wordmark -->
   <text x="236" y="118" font-size="64" font-weight="700" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="url(#bn-word)">FlashRec</text>
-  <text x="236" y="154" font-size="18" font-weight="500" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="#94a3b8">wide-beam inference engine · mini-sglang</text>
+  <text x="236" y="154" font-size="18" font-weight="500" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="#94a3b8">wide-beam inference engine</text>
 </svg>
