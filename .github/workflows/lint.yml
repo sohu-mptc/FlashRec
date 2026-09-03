@@ -30,7 +30,7 @@ jobs:
 
       # Cache the hook environments; without this every run rebuilds the
       # isort/black/ruff/clang-format virtualenvs from scratch.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
