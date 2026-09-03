@@ -1,0 +1,61 @@
+<svg width="860" height="240" viewBox="0 0 860 240" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="FlashRec · mini-sglang">
+  <title>FlashRec · mini-sglang</title>
+  <desc>Wide-beam inference engine for generative recommendation, based on mini-sglang</desc>
+  <defs>
+    <linearGradient id="bn-bg" x1="36" y1="36" x2="212" y2="212" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#111c34"/>
+      <stop offset="1" stop-color="#0b1222"/>
+    </linearGradient>
+    <linearGradient id="bn-card" x1="0" y1="0" x2="860" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#0b1222"/>
+    </linearGradient>
+    <linearGradient id="bn-beam" x1="76" y1="120" x2="196" y2="88" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="bn-word" x1="236" y1="90" x2="560" y2="90" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="860" height="240" rx="28" fill="url(#bn-card)"/>
+  <rect x="1.5" y="1.5" width="857" height="237" rx="26.5" stroke="#293a5c" stroke-width="3"/>
+
+  <!-- icon -->
+  <g transform="translate(36,36)">
+    <rect width="168" height="168" rx="34" fill="url(#bn-bg)"/>
+    <rect x="2" y="2" width="164" height="164" rx="32" stroke="#293a5c" stroke-width="2"/>
+    <g stroke="#3b4a68" stroke-width="3" stroke-linecap="round" fill="none">
+      <path d="M36 84 C 58 84 64 122 80 122"/>
+      <path d="M80 122 C 97 122 102 141 118 141"/>
+      <path d="M80 46 C 97 46 101 31 117 30"/>
+      <path d="M80 84 C 95 84 102 99 118 99"/>
+    </g>
+    <g fill="#3b4a68">
+      <circle cx="80" cy="122" r="4.2"/>
+      <circle cx="118" cy="141" r="3.8"/>
+      <circle cx="117" cy="30" r="3.8"/>
+      <circle cx="118" cy="99" r="3.8"/>
+    </g>
+    <g stroke="url(#bn-beam)" stroke-width="5" stroke-linecap="round" fill="none">
+      <path d="M36 84 C 58 84 63 46 80 46"/>
+      <path d="M80 46 C 97 46 102 58 118 59"/>
+      <path d="M118 59 C 130 59 135 47 148 47"/>
+      <path d="M36 84 C 59 84 64 84 80 84"/>
+      <path d="M80 84 C 96 84 102 70 118 70"/>
+      <path d="M118 70 C 131 70 136 79 148 80"/>
+      <path d="M118 59 C 131 60 137 65 148 65"/>
+    </g>
+    <circle cx="36" cy="84" r="7" fill="#e2e8f0"/>
+    <circle cx="36" cy="84" r="7" stroke="url(#bn-beam)" stroke-width="2.4"/>
+    <g fill="#7dd3fc"><circle cx="80" cy="46" r="4.7"/><circle cx="80" cy="84" r="4.7"/></g>
+    <g fill="#a78bfa"><circle cx="118" cy="59" r="4.2"/><circle cx="118" cy="70" r="4.2"/></g>
+    <g fill="#c4b5fd"><circle cx="148" cy="47" r="3.7"/><circle cx="148" cy="65" r="3.7"/><circle cx="148" cy="80" r="3.7"/></g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="236" y="118" font-size="64" font-weight="700" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="url(#bn-word)">FlashRec</text>
+  <text x="236" y="154" font-size="18" font-weight="500" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="#94a3b8">wide-beam inference engine · mini-sglang</text>
+</svg>

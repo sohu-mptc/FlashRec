@@ -1,0 +1,16 @@
+# .github/linters/lychee.toml
+no_progress = true
+verbose = "warn"
+timeout = 20
+max_concurrency = 8
+
+# Offline: relative links and anchors between the READMEs and docs/ are the
+# links that rot in this repo. External URLs are not fetched in CI, so a
+# third-party outage cannot fail a PR.
+offline = true
+
+exclude = [
+  "^https?://localhost(:[0-9]+)?(/|$)",
+  "^http://127\\.0\\.0\\.1(:[0-9]+)?(/|$)",
+  "^http://0\\.0\\.0\\.0(/|$)",
+]

@@ -1,0 +1,144 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashrec"
+# Single source of truth: python/flashrec/version.py.
+dynamic = ["version"]
+description = "Beam-search inference engine for generative recommendation (SID decoding with trie constraints)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Chongyang Wang" }, { name = "sohu-mptc" }]
+keywords = [
+    "beam-search",
+    "cuda",
+    "generative-recommendation",
+    "inference",
+    "llm",
+    "semantic-id",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+# Please keep dependency lists in this file sorted alphabetically by package
+# name. Upper bounds are deliberate: the FP8 kernels, CUDA-graph capture and
+# FlashInfer attention paths are ABI- and numerics-sensitive, so a silent major
+# upgrade can change results or fail to load rather than merely warn.
+dependencies = [
+    "apache-tvm-ffi>=0.1.5,<0.2",
+    "fastapi>=0.115",
+    "flashinfer_python>=0.6.4,<0.7",
+    "ninja>=1.11",
+    "numpy>=1.24",
+    "pydantic>=2.0,<3",
+    "safetensors>=0.4.3",
+    "sgl-kernel>=0.3.21,<0.4",
+    "torch>=2.9,<3",
+    "transformers>=4.51,<5",
+    "triton>=3.5,<4",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+build = ["build", "wheel"]
+dev = ["coverage>=7.0", "pre-commit>=4.0"]
+# pandas is only needed by scripts/eval_beam_matrix.py, not by the engine.
+eval = ["pandas>=2.0"]
+# orjson is an optional fast path in server/api.py; it falls back to json.
+perf = ["orjson>=3.9"]
+
+[project.scripts]
+flashrec = "flashrec.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sohu-mptc/FlashRec"
+Repository = "https://github.com/sohu-mptc/FlashRec"
+Documentation = "https://github.com/sohu-mptc/FlashRec#readme"
+Changelog = "https://github.com/sohu-mptc/FlashRec/blob/main/CHANGELOG.md"
+Issues = "https://github.com/sohu-mptc/FlashRec/issues"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "flashrec.version.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["flashrec*"]
+
+[tool.setuptools.package-data]
+flashrec = [
+    "py.typed",
+    "kernel/include/**/*.h",
+    "kernel/include/**/*.hpp",
+    "kernel/include/**/*.cuh",
+    "kernel/include/**/*.txt",
+    "kernel/csrc/**/*.cuh",
+    "kernel/csrc/**/*.h",
+    "kernel/csrc/**/*.cu",
+]
+
+# Kept in sync with .pre-commit-config.yaml so that a bare `ruff check` from a
+# shell or an editor reports exactly what CI enforces. See the comment there for
+# why the rule set is this narrow.
+[tool.ruff]
+extend-exclude = ["python/flashrec/kernel/include"]
+
+[tool.ruff.lint]
+select = ["F401", "F821", "UP037"]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exports in package initialisers are intentional.
+"**/__init__.py" = ["F401"]
+
+[tool.black]
+# Pin the target so formatting does not drift with whichever Python a
+# contributor happens to run black under; keep in sync with requires-python.
+target-version = ["py310"]
+extend-exclude = "python/flashrec/kernel/include"
+
+[tool.isort]
+profile = "black"
+known_first_party = ["flashrec"]
+extend_skip = ["python/flashrec/kernel/include"]
+
+# Domain terms and short identifiers that codespell flags as typos. `te`/`nd`/
+# `fo`/`ans` are inherited from the SGLang list (short tokens that appear inside
+# kernel identifiers); `SID`/`recs` are FlashRec specific.
+[tool.pytest.ini_options]
+# ``python/`` is the source tree; exposing it here means the tests import the
+# in-repo package without a per-test sys.path hack or a required editable
+# install. ``scripts/`` is handled by tests/conftest.py because it is not a
+# package (it only holds standalone tools for serving/benchmarking).
+pythonpath = ["python"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["python/flashrec"]
+omit = ["*/__pycache__/*"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING",
+]

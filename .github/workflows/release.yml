@@ -1,0 +1,78 @@
+name: Release
+
+# Publishes to PyPI when a `v*` tag is pushed. Set up a PyPI trusted publisher
+# for this repository (PyPI project settings → Publishing) so no API token has
+# to be stored as a secret; the `id-token: write` permission below is what the
+# trusted-publisher exchange needs.
+#
+# Dry run before tagging: `workflow_dispatch` builds and validates the
+# distributions and uploads them as a run artifact, without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      # A tag must match python/flashrec/version.py, otherwise the release
+      # on PyPI would carry a version nobody can correlate with the source.
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          pkg="$(python - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("python/flashrec/version.py").read_text()
+          print(re.search(r'__version__ = "([^"]+)"', text).group(1))
+          PY
+          )"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match __version__ $pkg" >&2
+            exit 1
+          fi
+          echo "ok: v$tag"
+
+      - name: Build sdist and wheel
+        run: python -m build --outdir dist .
+
+      - name: Check metadata
+        run: python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

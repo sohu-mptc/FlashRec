@@ -1,0 +1,45 @@
+name: Bug report
+description: Crash, wrong SID / scores, hang, or unexpected latency
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please fill in every section you can — a
+        reproduction against a public checkpoint is much easier to act on
+        than a log snippet alone.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Expected vs. actual behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Command line, request body, `--sid-vocab-file` (and any `--sid` override), and a minimal prompt.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, GPU, CUDA, Python, FlashRec version / git commit, model id.
+      placeholder: |
+        OS:
+        GPU:
+        CUDA:
+        Python:
+        FlashRec:
+        model:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / trace
+      description: Relevant server log lines, or a Chrome trace from `/start_profile`.

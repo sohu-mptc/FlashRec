@@ -1,0 +1,53 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit
+        run: python -m pip install pre-commit
+
+      # Cache the hook environments; without this every run rebuilds the
+      # isort/black/ruff/clang-format virtualenvs from scratch.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      # no-commit-to-branch is a local guard against committing straight to
+      # main; in CI the ref legitimately *is* main, so it is skipped.
+      - name: Run pre-commit
+        run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
+
+      # lychee is a manual-stage hook so that committing offline never blocks on
+      # link resolution; CI has no such constraint, so run it explicitly here.
+      - name: Check documentation links
+        run: pre-commit run --all-files --hook-stage manual lychee
+
+      # scripts/ are the documented entry points for serving and benchmarking,
+      # so they get the same gate as the Python. Not a pre-commit hook: that
+      # one downloads a binary, which breaks offline commits. serve.sh already
+      # carries an inline `shellcheck disable` directive.
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh

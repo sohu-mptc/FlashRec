@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/sohu-mptc/FlashRec/security/advisories/new
+    about: Private disclosure only. Do not file a public issue for security reports.

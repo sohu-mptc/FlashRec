@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Local artifacts. `data/` holds generated SID catalogs (scripts/build_catalog.sh)
+# and `results/` holds benchmark output: both are large, machine-specific, and
+# reproducible from the scripts, so neither belongs in the repository.
+profiles/
+data/
+results/
+*.whl
+.venv/
+venv/
+
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local serve knobs. Start from scripts/serve.env.example.
+scripts/serve.env
+/serve.env
+
+# Local private notes. Keep drafts in notes/; do not commit them.
+/notes/

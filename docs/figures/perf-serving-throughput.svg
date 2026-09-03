@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="490" viewBox="0 0 820 490" role="img" aria-label="SoHuRec-1.7B 吞吐对比 SGLang 0801 与 SGLang-master">
+  <rect width="820" height="490" fill="#ffffff"/>
+  <style>
+    .t { font-family: PingFang SC, Microsoft YaHei, Noto Sans SC, sans-serif; fill: #0f172a; }
+    .m { font-family: PingFang SC, Microsoft YaHei, Noto Sans SC, sans-serif; fill: #475569; }
+  </style>
+  <text class="m" x="36" y="36" font-size="13">SoHuRec-1.7B · FP8 W8A8 · 并发 32 · 每格 5,000 · NVIDIA RTX 5090</text>
+  <line x1="70" y1="360" x2="620" y2="360" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="364" font-size="11" text-anchor="end">0</text>
+  <line x1="70" y1="306" x2="620" y2="306" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="310" font-size="11" text-anchor="end">50</text>
+  <line x1="70" y1="252" x2="620" y2="252" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="256" font-size="11" text-anchor="end">100</text>
+  <line x1="70" y1="198" x2="620" y2="198" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="202" font-size="11" text-anchor="end">150</text>
+  <line x1="70" y1="144" x2="620" y2="144" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="148" font-size="11" text-anchor="end">200</text>
+  <line x1="70" y1="90" x2="620" y2="90" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="94" font-size="11" text-anchor="end">250</text>
+  <!-- n=50: 219.54 / 97.20 / 81.12 -->
+  <rect x="119" y="122.9" width="34" height="237.1" rx="5" fill="#2563eb"/>
+  <text class="t" x="136" y="114.9" font-size="11" font-weight="600" text-anchor="middle">219.5</text>
+  <rect x="158" y="255.0" width="34" height="105.0" rx="5" fill="#0d9488"/>
+  <text class="t" x="175" y="247.0" font-size="11" font-weight="600" text-anchor="middle">97.2</text>
+  <rect x="197" y="272.4" width="34" height="87.6" rx="5" fill="#64748b"/>
+  <text class="t" x="214" y="264.4" font-size="11" font-weight="600" text-anchor="middle">81.1</text>
+  <text class="t" x="175" y="384" font-size="13" font-weight="600" text-anchor="middle">n=50</text>
+  <!-- n=128: 136.78 / 54.22 / 55.65 -->
+  <rect x="304" y="212.3" width="34" height="147.7" rx="5" fill="#2563eb"/>
+  <text class="t" x="321" y="204.3" font-size="11" font-weight="600" text-anchor="middle">136.8</text>
+  <rect x="343" y="301.4" width="34" height="58.6" rx="5" fill="#0d9488"/>
+  <text class="t" x="360" y="293.4" font-size="11" font-weight="600" text-anchor="middle">54.2</text>
+  <rect x="382" y="299.9" width="34" height="60.1" rx="5" fill="#64748b"/>
+  <text class="t" x="399" y="291.9" font-size="11" font-weight="600" text-anchor="middle">55.7</text>
+  <text class="t" x="360" y="384" font-size="13" font-weight="600" text-anchor="middle">n=128</text>
+  <!-- n=512: 47.16 / 16.03 / 16.63 -->
+  <rect x="489" y="309.1" width="34" height="50.9" rx="5" fill="#2563eb"/>
+  <text class="t" x="506" y="301.1" font-size="11" font-weight="600" text-anchor="middle">47.2</text>
+  <rect x="528" y="342.7" width="34" height="17.3" rx="5" fill="#0d9488"/>
+  <text class="t" x="545" y="334.7" font-size="11" font-weight="600" text-anchor="middle">16.0</text>
+  <rect x="567" y="342.0" width="34" height="18.0" rx="5" fill="#64748b"/>
+  <text class="t" x="584" y="334.0" font-size="11" font-weight="600" text-anchor="middle">16.6</text>
+  <text class="t" x="545" y="384" font-size="13" font-weight="600" text-anchor="middle">n=512</text>
+  <rect x="640" y="108" width="16" height="16" rx="3" fill="#2563eb"/>
+  <text class="t" x="662" y="121" font-size="13">FlashRec</text>
+  <rect x="640" y="136" width="16" height="16" rx="3" fill="#0d9488"/>
+  <text class="t" x="662" y="149" font-size="13">SGLang 0801</text>
+  <rect x="640" y="164" width="16" height="16" rx="3" fill="#64748b"/>
+  <text class="t" x="662" y="177" font-size="13">SGLang-master</text>
+  <text class="m" x="36" y="430" font-size="13">相对 SGLang 0801：2.3× / 2.5× / 2.9×。相对 SGLang-master：2.7× / 2.5× / 2.8×。</text>
+  <text class="m" x="36" y="452" font-size="12">SGLang-master 与 SGLang 0801 分列。n=512 时对照侧约 16 req/s；FlashRec 约 47 req/s。</text>
+</svg>

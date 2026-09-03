@@ -1,0 +1,6 @@
+# Keep the tree LF on every clone; this project is Linux / CUDA only.
+* text=auto eol=lf
+
+# Vendored SGLang JIT headers: keep GitHub language stats on first-party code
+# and leave re-sync diffs uncluttered by linguist.
+python/flashrec/kernel/include/** linguist-vendored

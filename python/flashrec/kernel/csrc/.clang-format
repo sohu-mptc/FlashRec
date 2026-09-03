@@ -1,0 +1,15 @@
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 120
+AllowShortFunctionsOnASingleLine: Empty
+DerivePointerAlignment: false
+PointerAlignment: Left
+NamespaceIndentation: None
+SortIncludes: true
+AllowShortLoopsOnASingleLine: false
+BinPackParameters: false
+BinPackArguments: false
+AlignAfterOpenBracket: AlwaysBreak
+AlignOperands: Align
+PenaltyBreakBeforeFirstCallParameter: 1
+PenaltyReturnTypeOnItsOwnLine: 100

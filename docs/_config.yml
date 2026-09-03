@@ -1,0 +1,13 @@
+# GitHub Pages config for the docs/ directory (see .github/workflows/pages.yml).
+# The docs are plain Markdown so they read correctly both on github.com and on
+# Pages; this only picks a theme and title.
+title: FlashRec
+description: >-
+  An inference engine for generative recommendation, based on mini-sglang:
+  wide beam search over a semantic-ID catalog, inside CUDA graphs.
+theme: jekyll-theme-primer
+
+# `docs/README.md` is the index; links pointing above docs/ (../README.md,
+# ../examples/) resolve on github.com but not on the published site, so send
+# them to the repository instead.
+repository: sohu-mptc/FlashRec

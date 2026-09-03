@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: "FlashRec: A Wide-Beam Inference Engine for Generative Recommendation"
+message: If you use this software, please cite it as below.
+type: software
+authors:
+  - family-names: Wang
+    given-names: Chongyang
+  - name: sohu-mptc
+license: Apache-2.0
+repository-code: https://github.com/sohu-mptc/FlashRec
+url: https://github.com/sohu-mptc/FlashRec
+abstract: >-
+  An inference engine for generative recommendation, based on mini-sglang:
+  wide beam search over a semantic-ID catalog, executed inside CUDA graphs.
+keywords:
+  - beam-search
+  - cuda
+  - generative-recommendation
+  - inference
+  - semantic-id
+version: 0.1.0
+date-released: "2026-08-28"

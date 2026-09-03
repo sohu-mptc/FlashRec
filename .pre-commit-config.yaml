@@ -1,0 +1,86 @@
+default_stages: [pre-commit, pre-push, manual]
+
+# kernel/include/ is a vendored copy of the upstream sglang jit_kernel headers
+# (see kernel/include/ORIGIN.txt). Reformatting it would create a permanent diff
+# against upstream and make future re-syncs painful, so it is excluded globally.
+exclude: ^(python/flashrec/kernel/include/|FlashRec/python/flashrec/kernel/include/)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-ast
+      - id: check-added-large-files
+        args: ['--maxkb=1500']
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: debug-statements
+      - id: no-commit-to-branch
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 7.0.0
+    hooks:
+      - id: isort
+
+  # Narrow rule set, matching upstream sglang: unused imports (F401), undefined
+  # names (F821), and quoted-annotation cleanup (UP037). All three are
+  # auto-fixable, which keeps this a hard gate rather than a wall of advisory
+  # style noise. The rule set and the __init__.py re-export exemption live in
+  # pyproject.toml so a bare `ruff check` agrees with this hook.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^(python/flashrec/|tests/|scripts/)
+
+  - repo: https://github.com/psf/black
+    rev: 26.1.0
+    hooks:
+      - id: black
+
+  # Configured with args rather than [tool.codespell] in pyproject.toml on
+  # purpose: pre-commit runs hooks from the git root, so a pyproject.toml that
+  # is not at that root is never discovered and the settings silently go
+  # unapplied. Args are independent of where the config sits.
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args:
+          - --ignore-words-list=ans,te,nd,fo,inout,thi,iy,ist,recs,sid,nin
+          - --skip=*.json,*.jsonl,*.patch,*.txt,*.lock,*.svg,*.html
+
+  # Only the hand-written fused kernel is formatted; the vendored headers are
+  # covered by the global exclude above.
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v20.1.7
+    hooks:
+      - id: clang-format
+        types_or: [c++, cuda]
+        args: [--style=file, --verbose]
+
+  # shellcheck lives in the Lint workflow, not here: the shellcheck-py hook
+  # downloads a binary at install time, so adding it would make `pre-commit
+  # run` fail outright on an offline machine. CI runners have shellcheck
+  # preinstalled.
+
+  # Offline link check: catches dead relative links between the READMEs and
+  # docs/, which is the failure mode that bilingual docs actually hit. External
+  # URLs are not fetched here (see .github/linters/lychee.toml); CI runs the
+  # same config.
+  - repo: https://github.com/lycheeverse/lychee.git
+    rev: lychee-v0.22.0
+    hooks:
+      - id: lychee
+        name: check doc links (offline)
+        args: ["--config", ".github/linters/lychee.toml"]
+        stages: [manual]

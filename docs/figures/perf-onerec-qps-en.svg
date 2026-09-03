@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="450" viewBox="0 0 820 450" role="img" aria-label="OneRec-1.7B throughput vs SGLang 0801, SGLang-master, TensorRT-LLM, and vLLM">
+  <rect width="820" height="450" fill="#ffffff"/>
+  <style>
+    .t { font-family: -apple-system, Segoe UI, Helvetica Neue, Arial, sans-serif; fill: #0f172a; }
+    .m { font-family: -apple-system, Segoe UI, Helvetica Neue, Arial, sans-serif; fill: #475569; }
+  </style>
+  <text class="m" x="36" y="36" font-size="13">OneRec-1.7B · n=50 saturation · 5,000 · NVIDIA RTX 5090 · aligned concurrency</text>
+  <line x1="70" y1="340" x2="790" y2="340" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="344" font-size="11" text-anchor="end">0</text>
+  <line x1="70" y1="260" x2="790" y2="260" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="264" font-size="11" text-anchor="end">10</text>
+  <line x1="70" y1="180" x2="790" y2="180" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="184" font-size="11" text-anchor="end">20</text>
+  <line x1="70" y1="100" x2="790" y2="100" stroke="#e2e8f0" stroke-width="1"/>
+  <text class="m" x="60" y="104" font-size="11" text-anchor="end">30</text>
+  <rect x="100" y="115.4" width="70" height="224.6" rx="6" fill="#2563eb"/>
+  <text class="t" x="135" y="107.4" font-size="13" font-weight="600" text-anchor="middle">28.08</text>
+  <text class="t" x="135" y="362" font-size="12" font-weight="600" text-anchor="middle">FlashRec</text>
+  <text class="m" x="135" y="378" font-size="11" text-anchor="middle">conc 32</text>
+  <rect x="230" y="194.4" width="70" height="145.6" rx="6" fill="#0d9488"/>
+  <text class="t" x="265" y="186.4" font-size="13" font-weight="600" text-anchor="middle">18.20</text>
+  <text class="t" x="265" y="362" font-size="12" font-weight="600" text-anchor="middle">SGLang 0801</text>
+  <text class="m" x="265" y="378" font-size="11" text-anchor="middle">conc 32</text>
+  <rect x="360" y="229.0" width="70" height="111.0" rx="6" fill="#64748b"/>
+  <text class="t" x="395" y="221.0" font-size="13" font-weight="600" text-anchor="middle">13.88</text>
+  <text class="t" x="395" y="362" font-size="12" font-weight="600" text-anchor="middle">SGLang-master</text>
+  <text class="m" x="395" y="378" font-size="11" text-anchor="middle">conc 16</text>
+  <rect x="490" y="238.3" width="70" height="101.7" rx="6" fill="#d97706"/>
+  <text class="t" x="525" y="230.3" font-size="13" font-weight="600" text-anchor="middle">12.71</text>
+  <text class="t" x="525" y="362" font-size="12" font-weight="600" text-anchor="middle">TRT-LLM</text>
+  <text class="m" x="525" y="378" font-size="11" text-anchor="middle">conc 8</text>
+  <rect x="620" y="308.9" width="70" height="31.1" rx="6" fill="#94a3b8"/>
+  <text class="t" x="655" y="300.9" font-size="13" font-weight="600" text-anchor="middle">3.89</text>
+  <text class="t" x="655" y="362" font-size="12" font-weight="600" text-anchor="middle">vLLM</text>
+  <text class="m" x="655" y="378" font-size="11" text-anchor="middle">conc 16</text>
+  <text class="m" x="36" y="416" font-size="13"><tspan font-weight="700" fill="#0d9488">1.54×</tspan> vs 0801, <tspan font-weight="700" fill="#2563eb">2.02×</tspan> vs SGLang-master, 2.21× vs TRT, 7.2× vs vLLM. invalid 0 vs 18–27%.</text>
+</svg>

@@ -1,0 +1,60 @@
+Vendored third-party headers
+============================
+
+Contents
+--------
+sgl_kernel/ holds copies of the SGLang JIT-kernel include headers used to
+compile FlashRec's fused beam-trie kernel: TensorMatcher (tensor.h),
+LaunchKernel (utils.h), AlignedVector (vec.cuh), warp reduction helpers
+(warp.cuh), plus math.cuh, type.cuh, utils.cuh and source_location.h.
+
+These are NOT the pip package `sgl-kernel`. FlashRec compiles against
+this directory only; it does not read any `sglang/` source tree and does not
+import `sglang` at runtime.
+
+Upstream
+--------
+Project:  SGLang
+URL:      https://github.com/sgl-project/sglang
+Path:     the `sgl_kernel` include directory of the JIT kernel sources
+License:  Apache License 2.0
+
+Upstream commit: NOT RECORDED.
+
+  The revision these copies were taken from was not captured when they were
+  vendored, and it cannot be recovered from this repository. Record it at the
+  next re-sync (see below) so future diffs have a baseline.
+
+Licensing
+---------
+The upstream files carry no per-file copyright or SPDX headers, and the
+copies here are kept byte-identical to upstream -- no header has been added,
+so that a re-sync stays a clean diff and so that FlashRec does not
+assert a notice upstream itself does not carry.
+
+Attribution is provided at the distribution level in the NOTICE file in the
+project root, as Apache-2.0 section 4(d) requires. Both FlashRec and
+SGLang are Apache-2.0, so the license text in the root LICENSE file governs
+these files as well.
+
+Why this directory is excluded from lint
+----------------------------------------
+.pre-commit-config.yaml and the [tool.*] sections of pyproject.toml exclude
+this path from clang-format, ruff, black, isort and codespell. Formatting it
+to FlashRec's conventions would create a permanent diff against upstream
+and make every re-sync a manual merge. Leave it unformatted.
+
+Note the exclude patterns are listed twice, once rooted at this project and
+once prefixed with `FlashRec/`, so they match whether pre-commit runs
+with its git root at this project or at an enclosing repository.
+
+Re-syncing
+----------
+1. Pick the upstream commit to track and note its full SHA.
+2. Copy the `sgl_kernel` include headers over this directory verbatim. Do
+   not reformat and do not add headers.
+3. Update the "Upstream commit" field above with that SHA and the date.
+4. Rebuild the fused kernel and run the kernel tests -- these headers define
+   the launch and tensor-checking contracts the kernel compiles against, so
+   an upstream signature change surfaces as a compile error, not a runtime
+   fallback.

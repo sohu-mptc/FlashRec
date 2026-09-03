@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a model family, kernel, API, or serving change
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the repository README (supported models / roadmap)
+        and CONTRIBUTING.md before filing.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can you not do today, and who is blocked?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Concrete behaviour or API. Call out CUDA-graph / FP8 / SID-trie impact.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, other engines, or a smaller slice of the same idea.

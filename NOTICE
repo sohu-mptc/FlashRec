@@ -1,0 +1,35 @@
+FlashRec
+Copyright 2026 FlashRec contributors
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file in the project root.
+
+This product includes software developed by, or derived from, the
+following third-party projects. Their original licenses apply to the
+corresponding files.
+
+---------------------------------------------------------------------------
+SGLang / mini-sglang / sgl-kernel
+Copyright SGLang Team
+License: Apache License 2.0
+https://github.com/sgl-project/sglang
+https://github.com/sgl-project/mini-sglang
+
+- Module layout follows mini-sglang; the engine does not import `sglang`
+  at runtime.
+- `python/flashrec/kernel/include/` is a vendored copy of SGLang
+  `jit_kernel` headers (see that directory's ORIGIN.txt).
+- Beam-selection and SID-trie helpers in
+  `python/flashrec/search/select.py` and
+  `python/flashrec/search/trie.py` are ported and adapted from
+  sgl-project/sglang PR #31626.
+- `tests/test_beam_search_diff.py` is adapted from the SGLang beam-search
+  accuracy-diff test, including the GenRec codebook-constrained path
+  aligned with
+  https://github.com/cswuyg/sglang/tree/feature/beam_search_update_0801
+- The profiler HTTP interface is kept compatible with
+  `sglang.bench_serving --profile`.
+
+The files that retain an upstream copyright header keep
+"Copyright 2026 SGLang Team".
+---------------------------------------------------------------------------

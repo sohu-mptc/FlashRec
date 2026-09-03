@@ -1,0 +1,13 @@
+# Non-Python JIT sources (setuptools package-data + sdist fallback)
+recursive-include python/flashrec/kernel/include *.h *.hpp *.cuh *.txt
+recursive-include python/flashrec/kernel/csrc *.cuh *.h *.cu
+include python/flashrec/py.typed
+include README.md
+include README.zh-CN.md
+include LICENSE
+include NOTICE
+include CHANGELOG.md
+include CONTRIBUTING.md
+include CONTRIBUTING.zh-CN.md
+include CODE_OF_CONDUCT.md
+include SECURITY.md
