@@ -13,21 +13,25 @@ token 区间、codebook 大小和 boundary。不设 catalog 时做无约束解�
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `--model-path` | （必填） | 模型目录（权重 + tokenizer）。 |
+| `--model-path` | （必填） | 模型目录（权重 + tokenizer）。与 `--catalog` 一起用时不需要。 |
+| `--catalog` | 不设 | 从 RecIF 打包映射构建 SID catalog（`benchmark_data` 目录或 JSON 文件）。层数从源文件推断，默认写到 `data/catalogs/`。 |
+| `--catalog-out` | `data/catalogs` | catalog 输出 JSON，或 `--catalog` 为数据目录时的输出目录。 |
+| `--catalog-task` | `video` | `--catalog` 为目录时：`video` / `product` / `both`。 |
+| `--catalog-levels` | 自动 | 覆盖推断出的 SID 层数。 |
 | `--quantization` | `fp8` | 权重量化。`fp8` = W8A8 per-channel；`nvfp4` 预留。 |
 | `--kv-cache-dtype` | `fp8_e4m3` | KV cache 存储精度。 |
 | `--sid-vocab-file` | 不设 | 合法 SID 目录（JSON），构建约束 trie，并触发布局推断。 |
 | `--sid` | 不设 | 可选覆盖 `START:END/SIZE,...`。仅当 tokenizer 不用 `<s_a_0>` / `<\|sid_begin\|>` 约定时需要。 |
 | `--system-prompt` / `--system-prompt-file` | 不设 | 共享 system prompt，拼接到请求 messages 前。 |
 | `--warmup-user-a` / `--warmup-user-b` | 通用 probe | 两段不同的 user 文本，它们的最长公共前缀会钉进 radix cache。不设则只钉 chat template + system prompt。两边都设时，还可以钉上你自己流量里共享的 user 头。 |
+| `--warmup-iters` | 10 | 仅 serve 模式：CUDA graph capture 完成后、HTTP 端口打开前，先跑这么多次端到端 warmup 推理。设 `0` 关闭。 |
 
 OpenOneRec RecIF 的 `sid2pid.json` / `sid2iid.json` 用打包整数做 SID key。
 转换成 `--sid-vocab-file` 需要的逗号分隔 key JSON：
 
 ```bash
-bash scripts/build_catalog.sh
-# DATA_DIR=/path/to/benchmark_data TASK=video|product|both LEVELS=4
-python scripts/convert_recif_catalog.py --data-dir /path/to/benchmark_data
+flashrec --catalog /path/to/benchmark_data
+# flashrec --catalog /path/to/benchmark_data --catalog-task both --catalog-out data/catalogs
 ```
 
 默认写出 `data/catalogs/sid2pid_beamrec_l4.json`（key 为 `"a,b,c,1"`）。

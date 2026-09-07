@@ -32,15 +32,35 @@ def quantize_weight_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     return q, scale
 
 
+def as_channel_scale(
+    scale: torch.Tensor,
+    out_features: int,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Per-tensor scale → length ``out_features``; per-channel scale unchanged.
+
+    ModelOpt FP8 stores one scalar ``weight_scale`` per Linear. Qwen3 fused
+    ``qkv_proj`` / ``gate_up_proj`` concatenate those scalars first, so the
+    expand has to happen per original matrix (see ``merge_*_weights``).
+    """
+    s = scale.detach().to(dtype=torch.float32).reshape(-1)
+    if device is not None:
+        s = s.to(device=device)
+    n = int(s.numel())
+    if n == 1:
+        return s.expand(out_features).contiguous()
+    if n == out_features:
+        return s.contiguous()
+    raise ValueError(
+        f"FP8 weight_scale has {n} values, expected 1 (per-tensor) or "
+        f"{out_features} (per-channel); block-wise scales are not supported"
+    )
+
+
 def _channel_scale(
     scale: torch.Tensor, out_features: int, device: torch.device
 ) -> torch.Tensor:
-    s = scale.detach().to(device=device, dtype=torch.float32).reshape(-1)
-    if s.numel() == 1:
-        return s.expand(out_features).contiguous()
-    if s.numel() != out_features:
-        return s.reshape(out_features).contiguous()
-    return s.contiguous()
+    return as_channel_scale(scale, out_features, device)
 
 
 class Linear(nn.Module):

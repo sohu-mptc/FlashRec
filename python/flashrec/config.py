@@ -117,6 +117,9 @@ class BeamRecConfig:
     # pinned. Unset = pin chat template + system prompt only.
     warmup_user_a: Optional[str] = None
     warmup_user_b: Optional[str] = None
+    # End-to-end warmup generations run by the serve worker after CUDA-graph
+    # capture and before the HTTP port opens. 0 disables.
+    warmup_iters: int = 10
 
     beam_width: int = 50
     max_tokens: int = 5
@@ -160,6 +163,12 @@ class BeamRecConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "info"
+    # uvicorn access log formats one line per request on the event-loop
+    # thread; off by default for serving throughput.
+    access_log: bool = False
+    # Reject new requests with 503 once this many jobs are queued (0 = no
+    # cap). Bounds memory and tail latency under overload.
+    max_queue_len: int = 4096
     cuda_graph_capture_sizes: List[int] = field(
         default_factory=lambda: [50, 100, 150, 200, 250, 300, 350, 400, 800]
     )

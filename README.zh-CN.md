@@ -1,10 +1,10 @@
-![FlashRec · mini-sglang](assets/banner.svg)
+![FlashRec](assets/banner.svg)
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg) ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20CUDA-76B900.svg) ![CI](https://github.com/sohu-mptc/FlashRec/actions/workflows/ci.yml/badge.svg)
 
-**[特性](#主要特性)** | **[快速开始](#快速开始)** | **文档** | **示例** | **架构** | **API** | **评测** | **FAQ** | **[English](README.md)**
+**[特性](#主要特性)** | **[快速开始](#快速开始)** | **文档** | **示例** | **[架构](#架构)** | **API** | **评测** | **FAQ** | **[English](README.md)**
 
-**生成式推荐推理引擎（基于 mini-sglang）：在语义 ID 目录上执行宽 beam search，**  
+**生成式推荐推理引擎（基于 mini-sglang）：在语义 ID 目录上执行宽 beam search，**
 **解码路径在 CUDA graph 内完成。**
 
 ---
@@ -25,7 +25,7 @@
 SID 率由 trie 约束保证为 0。评测结果见 [评测](#评测)。
 
 
-|              | FlashRec          | 通用 LLM 引擎                            |
+|              | FlashRec              | 通用 LLM 引擎                            |
 | ------------ | --------------------- | ------------------------------------ |
 | 深度 / 宽度      | 3–5 步 × 50–512+ beam  | 数百～数千步 × 1 条序列                       |
 | 词表           | 合法 SID 续写（trie）       | 全词表、无约束                              |
@@ -68,11 +68,11 @@ pip install -e .
 hf download OpenOneRec/OneRec-1.7B --local-dir ./OneRec-1.7B
 
 # 从 OpenOneRec RecIF-Bench 的 benchmark_data 构建 SID catalog。
-DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data bash scripts/build_catalog.sh
+flashrec --catalog /path/to/OpenOneRec-RecIF/benchmark_data
 
 # 启动服务并约束到该 catalog。SID 布局由 tokenizer 推断。
-flashrec --serve --model-path ./OneRec-1.7B --port 8000 \
-  --beam-width 32 --max-tokens 5 \
+flashrec --serve --model-path ./OneRec-1.7B --port 8000 --host 0.0.0.0 \
+  --beam-width 512 --max-tokens 5 \
   --sid-vocab-file data/catalogs/sid2pid_beamrec_l4.json
 ```
 
@@ -97,7 +97,7 @@ tokenizer 推断。未指定 catalog 时在全词表上解码，仅用于通路�
 硬件为 **NVIDIA RTX 5090**。详见
 [评测](docs/baselines.zh-CN.md)。除非另行说明，FlashRec 为 FP8 + SID trie，对照引擎为
 开放词表。**SGLang-master**（[PR #31626](https://github.com/sgl-project/sglang/pull/31626)）
-与 **SGLang 0801**（[`cswuyg/sglang` `feature/beam_search_update_0801`](https://github.com/cswuyg/sglang/tree/feature/beam_search_update_0801)）
+与 **SGLang 0801**（`cswuyg/sglang` [](https://github.com/cswuyg/sglang/tree/feature/beam_search_update_0801)`feature/beam_search_update_0801`）
 分列，不要写成一行。
 
 评测覆盖：
@@ -111,16 +111,16 @@ RecIF-Bench video 任务，模型为
 长度差约 8×）。
 
 
-| 对照框架 | 设定 | 相对吞吐 |
-| --- | --- | --- |
-| **SGLang 0801** | OneRec，`n=50` 饱和 | **1.54×**（recall@32 均为 0.034；invalid 0 vs 0.270） |
-| **SGLang-master** | OneRec，`n=50` 饱和 | **2.02×**（recall@32 均为 0.034；invalid 0 vs 0.260） |
-| TensorRT-LLM | OneRec，`n=50` 饱和 | **2.21×** |
-| vLLM | OneRec，`n=50` 饱和 | **7.2×** |
-| **SGLang 0801** | SoHuRec-1.7B，`n=50–512` 饱和 | **2.3–3.0×** |
-| **SGLang-master** | SoHuRec-1.7B，`n=50–512` 饱和 | **2.5–2.9×** |
-| **SGLang 0801** | SoHuRec，`n=1000` 并发 1 | **2.1–2.2×**（conc ≥ 8 失败） |
-| **SGLang-master** | SoHuRec，`n=1000` 并发 1 | **2.1–2.2×**（conc ≥ 8 失败） |
+| 对照框架              | 设定                         | 相对吞吐                                             |
+| ----------------- | -------------------------- | ------------------------------------------------ |
+| **SGLang 0801**   | OneRec，`n=50` 饱和           | **1.54×**（recall@32 均为 0.034；invalid 0 vs 0.270） |
+| **SGLang-master** | OneRec，`n=50` 饱和           | **2.02×**（recall@32 均为 0.034；invalid 0 vs 0.260） |
+| TensorRT-LLM      | OneRec，`n=50` 饱和           | **2.21×**                                        |
+| vLLM              | OneRec，`n=50` 饱和           | **7.2×**                                         |
+| **SGLang 0801**   | SoHuRec-1.7B，`n=50–512` 饱和 | **2.3–3.0×**                                     |
+| **SGLang-master** | SoHuRec-1.7B，`n=50–512` 饱和 | **2.5–2.9×**                                     |
+| **SGLang 0801**   | SoHuRec，`n=1000` 并发 1      | **2.1–2.2×**（conc ≥ 8 失败）                        |
+| **SGLang-master** | SoHuRec，`n=1000` 并发 1      | **2.1–2.2×**（conc ≥ 8 失败）                        |
 
 
 OneRec 上 FlashRec 的 `invalid_rate` 为 0；开放词表引擎约为 17–27%。质量差主要来自
@@ -134,13 +134,13 @@ OneRec 上 FlashRec 的 `invalid_rate` 为 0；开放词表引擎约为 17–27%
 `n=50` 饱和（各引擎取最高已跑满并发）。
 
 
-| 引擎 | 约束 | QPS | conc | recall@32（conc=8） | invalid |
-| --- | --- | ---: | ---: | ---: | ---: |
-| **FlashRec** | SID trie | **28.08** | 32 | 0.034 | **0** |
-| SGLang 0801 | 开放词表 | 18.20 | 32 | 0.034 | 0.270 |
-| SGLang-master | 开放词表 | 13.88 | 16 | 0.034 | 0.260 |
-| TensorRT-LLM | 开放词表 | 12.71 | 8 | 0.034 | 0.259 |
-| vLLM | 开放词表 | 3.89 | 16 | 0.034 | 0.260 |
+| 引擎            | 约束       | QPS       | conc | recall@32（conc=8） | invalid |
+| ------------- | -------- | --------- | ---- | ----------------- | ------- |
+| **FlashRec**  | SID trie | **28.08** | 32   | 0.034             | **0**   |
+| SGLang 0801   | 开放词表     | 18.20     | 32   | 0.034             | 0.270   |
+| SGLang-master | 开放词表     | 13.88     | 16   | 0.034             | 0.260   |
+| TensorRT-LLM  | 开放词表     | 12.71     | 8    | 0.034             | 0.259   |
+| vLLM          | 开放词表     | 3.89      | 16   | 0.034             | 0.260   |
 
 
 相对 SGLang 0801 **1.54×**，相对 SGLang-master **2.02×**，相对 TensorRT-LLM **2.21×**，
@@ -189,9 +189,14 @@ per-channel）以及带 `weight_scale` 的预量化 FP8 checkpoint。`--quantiza
 
 请求在持有权重与 KV 池的同一进程内完成；HTTP、调度与模型共享同一地址空间。
 
-模块布局参考 [mini-sglang](https://github.com/sgl-project/mini-sglang)，运行时
-依赖 `sgl-kernel`、`flashinfer_python` 与 `triton`。请求路径、设计说明与模块
-结构见 [架构](docs/architecture.md)。
+![请求路径：准入、分词、Radix 前缀命中、批量 Prefill、SID Trie 约束扩展、CUDA Graph Decode 循环、排序后的 OpenAI 响应](assets/architecture-pipeline.jpg)
+
+流水线按最长前缀匹配准入请求，在 Host 线程池完成分词，复用 radix 前缀 KV，
+仅对未命中后缀做 prefill，经融合 trie kernel 对合法 SID 边打分，并在 CUDA
+graph 重放中完成 decode。模块布局参考
+[mini-sglang](https://github.com/sgl-project/mini-sglang)，运行时依赖
+`sgl-kernel`、`flashinfer_python` 与 `triton`。请求路径、设计说明与模块结构见
+[架构](docs/architecture.md)。
 
 ## 文档
 

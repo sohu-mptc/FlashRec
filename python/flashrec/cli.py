@@ -1,4 +1,4 @@
-"""CLI for FlashRec offline generate / HTTP serve."""
+"""CLI for FlashRec offline generate / HTTP serve / SID catalog convert."""
 
 from __future__ import annotations
 
@@ -6,18 +6,62 @@ import argparse
 import json
 import logging
 import sys
+import textwrap
+from pathlib import Path
 from typing import List, Optional
 
 from flashrec.config import BeamRecConfig, parse_int_list
-from flashrec.scheduler.scheduler import BeamRecEngine
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="flashrec",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="FlashRec: beam-search engine for generative recommendation",
+        epilog=textwrap.dedent("""\
+            examples:
+              flashrec --catalog /path/to/benchmark_data
+              flashrec --catalog sid2pid.json --catalog-out out.json
+              flashrec --serve --model-path ./OneRec-1.7B \\
+                --sid-vocab-file data/catalogs/sid2pid_beamrec_l4.json
+            """),
     )
-    p.add_argument("--model-path", required=True)
+    cat = p.add_argument_group("catalog")
+    cat.add_argument(
+        "--catalog",
+        default=None,
+        metavar="PATH",
+        help="Build a SID catalog from RecIF packed mappings. PATH is a "
+        "benchmark_data directory (sid2pid.json / sid2iid.json) or a JSON "
+        "file. Layer count is inferred from the source. Does not need "
+        "--model-path.",
+    )
+    cat.add_argument(
+        "--catalog-out",
+        default=None,
+        metavar="PATH",
+        help="Catalog output JSON file, or directory when --catalog is a data "
+        "dir (default: data/catalogs).",
+    )
+    cat.add_argument(
+        "--catalog-task",
+        choices=("video", "product", "both"),
+        default="video",
+        help="Which RecIF mapping to convert when --catalog is a directory "
+        "(default: video).",
+    )
+    cat.add_argument(
+        "--catalog-levels",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override inferred SID depth (default: auto from source keys).",
+    )
+    p.add_argument(
+        "--model-path",
+        default=None,
+        help="Model directory (weights + tokenizer). Required unless --catalog.",
+    )
     p.add_argument("--prompt", default=None)
     p.add_argument("--messages-json", default=None)
     p.add_argument("--beam-width", "--n", dest="beam_width", type=int, default=50)
@@ -50,6 +94,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "shared user-head; unset pins template + system prompt only.",
     )
     p.add_argument("--warmup-user-b", default=None)
+    p.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=10,
+        help="Serve-mode warmup generations run before the port opens " "(0 disables).",
+    )
     p.add_argument("--max-seq-len", type=int, default=4096)
     p.add_argument("--length-penalty", type=float, default=1.0)
     p.add_argument("--cuda-graph-max-bs", type=int, default=800)
@@ -91,6 +141,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--log-level", default="info")
+    p.add_argument("--access-log", action="store_true")
+    # 0 = unbounded queue.
+    p.add_argument("--max-queue-len", type=int, default=4096)
     return p
 
 
@@ -114,6 +167,7 @@ def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
         system_prompt_file=args.system_prompt_file,
         warmup_user_a=args.warmup_user_a,
         warmup_user_b=args.warmup_user_b,
+        warmup_iters=args.warmup_iters,
         max_seq_len=args.max_seq_len,
         length_penalty=args.length_penalty,
         beam_width=args.beam_width,
@@ -144,6 +198,8 @@ def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
         host=args.host,
         port=args.port,
         log_level=args.log_level,
+        access_log=args.access_log,
+        max_queue_len=args.max_queue_len,
     )
     sizes = parse_int_list(args.cuda_graph_capture_sizes)
     if sizes:
@@ -152,7 +208,19 @@ def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.catalog:
+        from flashrec.catalog import run_catalog
+
+        return run_catalog(
+            Path(args.catalog),
+            out=Path(args.catalog_out) if args.catalog_out else None,
+            task=args.catalog_task,
+            levels=args.catalog_levels,
+        )
+    if not args.model_path:
+        parser.error("--model-path is required unless --catalog is set")
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -163,6 +231,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         serve(cfg)
         return 0
+    from flashrec.scheduler.scheduler import BeamRecEngine
+
     engine = BeamRecEngine(cfg)
     messages = json.loads(args.messages_json) if args.messages_json else None
     result = engine.generate(

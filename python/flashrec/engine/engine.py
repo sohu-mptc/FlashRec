@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from itertools import accumulate
 from typing import List, Optional, Tuple
 
 import torch
@@ -11,6 +12,7 @@ from flashrec.attention.flashinfer import AttentionBackend
 from flashrec.config import BeamRecConfig
 from flashrec.core import ForwardBatch
 from flashrec.engine.graph import DecodeGraphRunner, ExpandCaptureSpec
+from flashrec.engine.staging import PinnedStage
 from flashrec.kernel.beam_trie import GenrecFusedResult
 from flashrec.kvcache.pool import ReqToTokenPool, TokenToKVPool
 from flashrec.kvcache.radix import PrefixCache
@@ -41,6 +43,7 @@ class ModelEngine:
         )
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
+        self._stage = PinnedStage()
         self.compute_dtype = _dtype(config.compute_dtype)
         kv_dtype = (
             _dtype(config.kv_cache_dtype)
@@ -243,11 +246,17 @@ class ModelEngine:
         table = self.req_pool.req_to_token
         n, bw = beam_rows.shape
         m = max(int(s) for s in seq_lens)
-        dst = beam_rows.to(dtype=torch.int64).reshape(-1)
-        src = torch.as_tensor(
-            [int(s) for s in srcs], dtype=torch.int64, device=table.device
-        ).repeat_interleave(bw)
-        table[dst, :m] = table[src, :m]
+        # Gather the n unique source rows once and let the scatter broadcast
+        # across beams: repeat_interleave would read every source row bw times
+        # and materialize an (n*bw, m) temp. Route the small index list
+        # through pinned staging instead of a pageable H2D.
+        ids = [int(s) for s in srcs]
+        if table.device.type == "cuda":
+            src_t, _ = self._stage.copy_list("beam_src", ids, table.device, torch.int64)
+        else:
+            src_t = torch.as_tensor(ids, dtype=torch.int64, device=table.device)
+        dst2d = beam_rows.to(dtype=torch.int64)
+        table[dst2d, :m] = table[src_t, :m].unsqueeze(1)
 
     def gather_kv_indices(
         self, rows: torch.Tensor, seq_lens, out=None, total: Optional[int] = None
@@ -267,8 +276,16 @@ class ModelEngine:
         ext = batch.extend_seq_lens
         if not ext:
             return hidden
-        t = torch.as_tensor(list(ext), device=hidden.device, dtype=torch.int64)
-        return hidden[torch.cumsum(t, dim=0) - 1]
+        # Last-token offsets are a CPU accumulate over a Python list; a GPU
+        # cumsum here would pay a pageable H2D plus two kernels per prefill.
+        offs = [o - 1 for o in accumulate(int(x) for x in ext)]
+        if hidden.device.type == "cuda":
+            idx_t, _ = self._stage.copy_list(
+                "last_tok_idx", offs, hidden.device, torch.int64
+            )
+        else:
+            idx_t = torch.as_tensor(offs, dtype=torch.int64, device=hidden.device)
+        return hidden[idx_t]
 
     def ensure_cuda_graph(
         self, expand_spec: Optional[ExpandCaptureSpec] = None

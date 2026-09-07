@@ -57,6 +57,18 @@ class TestLazyImport:
     def test_dir_lists_public_api(self):
         assert sorted(flashrec.__all__) == sorted(dir(flashrec))
 
+    def test_cli_help_lists_catalog_without_torch(self):
+        out = _in_subprocess(
+            "from flashrec.cli import _build_parser; import sys;"
+            "text=_build_parser().format_help();"
+            "print('yes' if '--catalog PATH' in text else 'no');"
+            f"print('none' if not any(m in sys.modules for m in {HEAVY!r}) else "
+            f"' '.join(m for m in {HEAVY!r} if m in sys.modules))"
+        )
+        lines = out.splitlines()
+        assert lines[0] == "yes"
+        assert lines[1] == "none", f"flashrec.cli loaded: {lines[1]}"
+
 
 class TestVersionSingleSource:
     """version.py is the only place the version is written down."""
@@ -77,6 +89,15 @@ class TestVersionSingleSource:
     def test_dynamic_source_is_version_module(self):
         dynamic = self._pyproject()["tool"]["setuptools"]["dynamic"]
         assert dynamic["version"] == {"attr": "flashrec.version.__version__"}
+
+    def test_build_wheel_stamps_version_module_not_pyproject(self):
+        # ``pip install -e .`` never touches this script; the wheel path does.
+        # A leftover regex for static ``version =`` in pyproject.toml is what
+        # made ``bash scripts/build_wheel.sh`` fail after version went dynamic.
+        script = (ROOT / "scripts" / "build_wheel.sh").read_text()
+        assert "python/flashrec/version.py" in script
+        assert "failed to patch version" not in script
+        assert 'r\'^version\\s*=\\s*"[^"]*"\'' not in script
 
 
 class TestCheckEnv:

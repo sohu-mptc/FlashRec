@@ -3,7 +3,8 @@ name: sid-catalog
 description: >-
   Build SID trie catalogs for FlashRec from OpenOneRec RecIF packed
   mappings. Use when the user mentions sid-vocab-file, sid2pid, 物品目录,
-  catalog, trie, convert_recif_catalog, build_catalog.sh, or illegal SID rate.
+  catalog, trie, flashrec --catalog, convert_recif_catalog, build_catalog.sh,
+  or illegal SID rate.
 ---
 
 # 构建 SID catalog
@@ -11,27 +12,25 @@ description: >-
 `--sid-vocab-file` 需要逗号 key 的 JSON（如 `"a,b,c,1"`）。RecIF 原始
 `sid2pid.json` / `sid2iid.json` 用打包整数，必须先转换。不转换直接喂引擎会建错 trie。
 
-## 默认（RecIF video，4 层）
+## 默认（按源文件自动分层）
 
 ```bash
-DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data \
-  bash scripts/build_catalog.sh
+flashrec --catalog /path/to/OpenOneRec-RecIF/benchmark_data
 ```
 
-写出 `data/catalogs/sid2pid_beamrec_l4.json`。`data/` 已 gitignore，不要提交生成物。
+RecIF 打包整数（`a*8192^2+b*8192+c`）会写成 4 层 `data/catalogs/sid2pid_beamrec_l4.json`（末段 `1` = `<|sid_end|>`）。逗号 key 按源文件段数原样保留。`data/` 已 gitignore，不要提交生成物。
 
-| 变量 | 默认 | 含义 |
+| 旗标 / 变量 | 默认 | 含义 |
 |------|------|------|
-| `DATA_DIR` | （必填） | RecIF `benchmark_data` 目录 |
-| `TASK` | `video` | `video` / `product` / `both` |
-| `LEVELS` | `4` | `3` = `"a,b,c"`；`4` = `"a,b,c,1"`（第 4 层是 `{sid_begin, sid_end}`，code `1` = `<\|sid_end\|>`） |
-| `OUT_DIR` | `data/catalogs` | 输出目录 |
-
-等价 Python：
+| `--catalog` / `DATA_DIR` | （必填） | RecIF `benchmark_data` 目录或 `sid2pid.json` |
+| `--catalog-task` / `TASK` | `video` | `video` / `product` / `both` |
+| `--catalog-levels` / `LEVELS` | （自动） | 覆盖推断层数。`3` = `"a,b,c"`；`4` = 在 3 层 RecIF 后追加 `{sid_begin, sid_end}` |
+| `--catalog-out` / `OUT_DIR` | `data/catalogs` | 输出目录或 JSON 文件 |
 
 ```bash
-python scripts/convert_recif_catalog.py --data-dir /path/to/benchmark_data
-python scripts/convert_recif_catalog.py sid2pid.json out.json --levels 3
+flashrec --catalog sid2pid.json --catalog-out out.json
+flashrec --catalog sid2pid.json --catalog-out out.json --catalog-levels 3
+DATA_DIR=/path/to/benchmark_data bash scripts/build_catalog.sh
 ```
 
 ## 与服务参数对齐
@@ -51,5 +50,5 @@ checkpoint 的 token id 抄过去。
 ## 检查
 
 - 输出 JSON 根对象的 key 是逗号分隔整数，不是打包十进制
-- `LEVELS=4` 时 key 为 4 段且末段为 `1`
+- RecIF 打包源默认 4 段且末段为 `1`；逗号源保持原段数（不要把真实第 4 码改成 `1`）
 - 启动服务后 `invalid_rate` 应为 0；若 ~0.28，说明仍在跑开放词表（没挂 vocab 文件）

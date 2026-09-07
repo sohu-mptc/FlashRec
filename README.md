@@ -1,28 +1,11 @@
-<div align="center">
-  <img src="assets/banner.svg" alt="FlashRec · mini-sglang" width="720"/>
+![FlashRec](assets/banner.svg)
 
-  <p>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"/></a>
-    <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg" alt="Python"/></a>
-    <a href="#quickstart"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20CUDA-76B900.svg" alt="Platform"/></a>
-    <a href="https://github.com/sohu-mptc/FlashRec/actions/workflows/ci.yml"><img src="https://github.com/sohu-mptc/FlashRec/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
-  </p>
+![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg) ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20CUDA-76B900.svg) ![CI](https://github.com/sohu-mptc/FlashRec/actions/workflows/ci.yml/badge.svg)
 
-  <p>
-    <a href="#features"><b>Features</b></a> |
-    <a href="#quickstart"><b>Quickstart</b></a> |
-    <a href="docs/README.md"><b>Documentation</b></a> |
-    <a href="examples/"><b>Examples</b></a> |
-    <a href="docs/architecture.md"><b>Architecture</b></a> |
-    <a href="docs/api.md"><b>API</b></a> |
-    <a href="docs/baselines.md"><b>Evaluation</b></a> |
-    <a href="docs/faq.md"><b>FAQ</b></a> |
-    <a href="README.zh-CN.md"><b>简体中文</b></a>
-  </p>
+**[Features](#features)** | **[Quickstart](#quickstart)** | **Documentation** | **Examples** | **[Architecture](#architecture)** | **API** | **Evaluation** | **FAQ** | **[简体中文](README.zh-CN.md)**
 
-  <p><b>An inference engine for generative recommendation, based on mini-sglang:<br/>
-  wide beam search over a semantic-ID catalog, executed inside CUDA graphs.</b></p>
-</div>
+**An inference engine for generative recommendation, based on mini-sglang:**
+**wide beam search over a semantic-ID catalog, executed inside CUDA graphs.**
 
 ---
 
@@ -34,12 +17,9 @@ engines are optimized for long-sequence, single-path decoding; a wide-beam
 request occupies the engine, and throughput does not scale with concurrency.
 FlashRec is designed for this workload.
 
-<div align="center">
-  <img src="docs/figures/perf-serving-throughput-en.svg" alt="SoHuRec-1.7B throughput vs SGLang 0801 and SGLang-master at concurrency 32, FP8" width="720"/>
-</div>
-<div align="center">
-  <img src="docs/figures/perf-onerec-qps-en.svg" alt="OneRec-1.7B throughput vs SGLang 0801, SGLang-master, TensorRT-LLM, and vLLM at n=50 saturation" width="720"/>
-</div>
+![SoHuRec-1.7B throughput vs SGLang 0801 and SGLang-master at concurrency 32, FP8](docs/figures/perf-serving-throughput-en.svg)
+
+![OneRec-1.7B throughput vs SGLang 0801, SGLang-master, TensorRT-LLM, and vLLM at n=50 saturation](docs/figures/perf-onerec-qps-en.svg)
 
 ## Features
 
@@ -47,40 +27,44 @@ The engine targets short SID depth, wide beam, and catalog-constrained decoding.
 Throughput scales with beam width `n` and concurrency; the illegal-SID rate is
 0 under the trie constraint. Measurements are in [Evaluation](#evaluation).
 
-| | FlashRec | General LLM engines |
-| --- | --- | --- |
-| Depth / width | 3–5 steps × 50–512+ beams | hundreds–thousands of steps × 1 sequence |
-| Vocabulary | valid-SID continuations (trie) | full, unconstrained |
-| Wide-beam graphs | including expansion, captured at multiples of `n`, one replay | capture often sized for decode batch; wide beam runs eager |
-| Illegal SIDs | **0** | ~17–27%, filtered after the fact |
-| Concurrency | beam-row slot budget; rows from different requests share a step | one wide-beam request occupies the engine; throughput roughly flat |
+
+|                  | FlashRec                                                        | General LLM engines                                                |
+| ---------------- | --------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Depth / width    | 3–5 steps × 50–512+ beams                                       | hundreds–thousands of steps × 1 sequence                           |
+| Vocabulary       | valid-SID continuations (trie)                                  | full, unconstrained                                                |
+| Wide-beam graphs | including expansion, captured at multiples of `n`, one replay   | capture often sized for decode batch; wide beam runs eager         |
+| Illegal SIDs     | **0**                                                           | ~17–27%, filtered after the fact                                   |
+| Concurrency      | beam-row slot budget; rows from different requests share a step | one wide-beam request occupies the engine; throughput roughly flat |
+
 
 **Decoding**
 
 - **CUDA graphs.** Beam widths from 50 to 512+ run in captured graphs, including
-  the beam-expansion step. Capture sizes extend to multiples of the configured
-  width, so a wide beam is a single graph replay.
+the beam-expansion step. Capture sizes extend to multiples of the configured
+width, so a wide beam is a single graph replay.
 - **SID constraint.** A fused CUDA kernel (dense or CSR-sparse trie) restricts
-  decoding to a catalog of valid semantic IDs. `lm_head` is evaluated only over
-  the SID token range. Illegal SIDs are never candidates, so `invalid_rate` is
-  0; open-vocabulary baselines leave ~17–27% of beams illegal.
+decoding to a catalog of valid semantic IDs. `lm_head` is evaluated only over
+the SID token range. Illegal SIDs are never candidates, so `invalid_rate` is
+0; open-vocabulary baselines leave ~17–27% of beams illegal.
 - **Scheduling.** Requests are admitted into decode waves between steps under a
-  beam-row slot budget, so beam rows from different requests share a step. A
-  radix prefix KV cache with longest-prefix-match scheduling reduces the cost of
-  shared prompts; aging prevents starvation.
+beam-row slot budget, so beam rows from different requests share a step. A
+radix prefix KV cache with longest-prefix-match scheduling reduces the cost of
+shared prompts; aging prevents starvation.
 
 **Serving**
 
 - **In-process serving.** HTTP, scheduling, weights, and the KV pool share one
-  process and one address space.
+process and one address space.
 - **FP8 by default.** W8A8 per-channel weights and `fp8_e4m3` KV, with fused
-  RMSNorm→FP8, SiLU→FP8, and QK-RoPE+KV-write. On 1.7B-class checkpoints at
-  `n ≤ 128` the main gain is weight and KV-cache footprint; at `n = 512` the two
-  precisions converge on throughput, where the step is bound by bookkeeping.
+RMSNorm→FP8, SiLU→FP8, and QK-RoPE+KV-write. On 1.7B-class checkpoints at
+`n ≤ 128` the main gain is weight and KV-cache footprint; at `n = 512` the two
+precisions converge on throughput, where the step is bound by bookkeeping.
 - **API.** Ranked beams on `/v1/chat/completions`. Deterministic top-*k* at
-  `temperature = 0`; Gumbel top-*k* without replacement above it.
+`temperature = 0`; Gumbel top-*k* without replacement above it.
 - **Profiler.** `/start_profile` / `/stop_profile` compatible with
-  `sglang.bench_serving --profile`.
+`sglang.bench_serving --profile`.
+
+
 
 ## Quickstart
 
@@ -90,12 +74,12 @@ pip install -e .
 # Public GenRec checkpoint used in the documentation.
 hf download OpenOneRec/OneRec-1.7B --local-dir ./OneRec-1.7B
 
-# Build the SID catalog from an OpenOneRec RecIF-Bench benchmark_data directory.
-DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data bash scripts/build_catalog.sh
+# Build a SID catalog from OpenOneRec RecIF-Bench benchmark_data.
+flashrec --catalog /path/to/OpenOneRec-RecIF/benchmark_data
 
 # Serve, constrained to that catalog. Layout is inferred from the tokenizer.
-flashrec --serve --model-path ./OneRec-1.7B --port 8000 \
-  --beam-width 32 --max-tokens 5 \
+flashrec --serve --model-path ./OneRec-1.7B --port 8000 --host 0.0.0.0 \
+  --beam-width 512 --max-tokens 5 \
   --sid-vocab-file data/catalogs/sid2pid_beamrec_l4.json
 ```
 
@@ -126,29 +110,31 @@ an **NVIDIA RTX 5090**. See
 a SID trie; the baselines are open-vocabulary. **SGLang-master**
 ([PR #31626](https://github.com/sgl-project/sglang/pull/31626)) and
 **SGLang 0801**
-([`cswuyg/sglang` `feature/beam_search_update_0801`](https://github.com/cswuyg/sglang/tree/feature/beam_search_update_0801))
+(`cswuyg/sglang` [](https://github.com/cswuyg/sglang/tree/feature/beam_search_update_0801)`feature/beam_search_update_0801`)
 are separate engines; do not collapse them into one row.
 
 Evaluation covers:
 
 - **OneRec:** the [OpenOneRec](https://github.com/Kuaishou-OneRec/OpenOneRec)
-  RecIF-Bench video task with
-  [OneRec-1.7B](https://huggingface.co/OpenOneRec/OneRec-1.7B)
+RecIF-Bench video task with
+[OneRec-1.7B](https://huggingface.co/OpenOneRec/OneRec-1.7B)
 - **SoHuRec-1.7B / SoHuRec-0.6B:** Sohu internal generative-recommendation serving traffic on the corresponding models
 
 Speed-ups are FlashRec relative to that baseline. Do not divide OneRec QPS by
 SoHuRec QPS (prompt length differs by about 8×).
 
-| Baseline | Setting | Relative throughput |
-| --- | --- | --- |
-| **SGLang 0801** | OneRec, `n=50` saturation | **1.54×** (recall@32 0.034 both; invalid 0 vs 0.270) |
-| **SGLang-master** | OneRec, `n=50` saturation | **2.02×** (recall@32 0.034 both; invalid 0 vs 0.260) |
-| TensorRT-LLM | OneRec, `n=50` saturation | **2.21×** |
-| vLLM | OneRec, `n=50` saturation | **7.2×** |
-| **SGLang 0801** | SoHuRec-1.7B, `n=50–512` saturation | **2.3–3.0×** |
-| **SGLang-master** | SoHuRec-1.7B, `n=50–512` saturation | **2.5–2.9×** |
-| **SGLang 0801** | SoHuRec, `n=1000`, concurrency 1 | **2.1–2.2×** (dies at conc ≥ 8) |
-| **SGLang-master** | SoHuRec, `n=1000`, concurrency 1 | **2.1–2.2×** (dies at conc ≥ 8) |
+
+| Baseline          | Setting                             | Relative throughput                                  |
+| ----------------- | ----------------------------------- | ---------------------------------------------------- |
+| **SGLang 0801**   | OneRec, `n=50` saturation           | **1.54×** (recall@32 0.034 both; invalid 0 vs 0.270) |
+| **SGLang-master** | OneRec, `n=50` saturation           | **2.02×** (recall@32 0.034 both; invalid 0 vs 0.260) |
+| TensorRT-LLM      | OneRec, `n=50` saturation           | **2.21×**                                            |
+| vLLM              | OneRec, `n=50` saturation           | **7.2×**                                             |
+| **SGLang 0801**   | SoHuRec-1.7B, `n=50–512` saturation | **2.3–3.0×**                                         |
+| **SGLang-master** | SoHuRec-1.7B, `n=50–512` saturation | **2.5–2.9×**                                         |
+| **SGLang 0801**   | SoHuRec, `n=1000`, concurrency 1    | **2.1–2.2×** (dies at conc ≥ 8)                      |
+| **SGLang-master** | SoHuRec, `n=1000`, concurrency 1    | **2.1–2.2×** (dies at conc ≥ 8)                      |
+
 
 On OneRec, FlashRec has `invalid_rate = 0`; open-vocabulary engines leave about
 17–27% of beams illegal. The quality gap is **whether SID constraint is on**,
@@ -162,13 +148,15 @@ and sample count.
 model [OneRec-1.7B](https://huggingface.co/OpenOneRec/OneRec-1.7B). 5,000
 samples, `n=50` saturation (highest completed concurrency per engine).
 
-| Engine | Constraint | QPS | conc | recall@32 (conc=8) | invalid |
-| --- | --- | ---: | ---: | ---: | ---: |
-| **FlashRec** | SID trie | **28.08** | 32 | 0.034 | **0** |
-| SGLang 0801 | open-vocab | 18.20 | 32 | 0.034 | 0.270 |
-| SGLang-master | open-vocab | 13.88 | 16 | 0.034 | 0.260 |
-| TensorRT-LLM | open-vocab | 12.71 | 8 | 0.034 | 0.259 |
-| vLLM | open-vocab | 3.89 | 16 | 0.034 | 0.260 |
+
+| Engine        | Constraint | QPS       | conc | recall@32 (conc=8) | invalid |
+| ------------- | ---------- | --------- | ---- | ------------------ | ------- |
+| **FlashRec**  | SID trie   | **28.08** | 32   | 0.034              | **0**   |
+| SGLang 0801   | open-vocab | 18.20     | 32   | 0.034              | 0.270   |
+| SGLang-master | open-vocab | 13.88     | 16   | 0.034              | 0.260   |
+| TensorRT-LLM  | open-vocab | 12.71     | 8    | 0.034              | 0.259   |
+| vLLM          | open-vocab | 3.89      | 16   | 0.034              | 0.260   |
+
 
 **1.54×** vs SGLang 0801, **2.02×** vs SGLang-master, **2.21×** vs
 TensorRT-LLM, **7.2×** vs vLLM. At `n=1000` FlashRec saturates at **4.62 QPS**;
@@ -188,16 +176,18 @@ BF16 and in FP8. See [Evaluation](docs/baselines.md); commands in
 [Examples](examples/README.md).
 
 - **OneRec-1.7B (RTX 5090):** BF16 matches HuggingFace's best SID at every width
-  (`n = 1–512`); beam-set overlap **86–92%**. FP8 swaps top-1 at `n = 1` on a
-  0.125-nat near-tie; overlap is **80%** at `n = 20` and **70–76%** at `n ≥ 50`.
-  HuggingFace's best sequence is inside the FlashRec beam from `n = 20`.
-  The public checkpoint is not FP8-trained; that drop is on-load quantization,
-  **not a framework bug**.
+(`n = 1–512`); beam-set overlap **86–92%**. FP8 swaps top-1 at `n = 1` on a
+0.125-nat near-tie; overlap is **80%** at `n = 20` and **70–76%** at `n ≥ 50`.
+HuggingFace's best sequence is inside the FlashRec beam from `n = 20`.
+The public checkpoint is not FP8-trained; that drop is on-load quantization,
+**not a framework bug**.
 - **SoHuRec-1.7B / SoHuRec-0.6B (FP8-trained, RTX 5090, FP8 decoder GEMM on both sides):**
-  beam-set overlap **88–96%** / **88–93%**; prefill top-1 is 100% on SoHuRec-1.7B and
-  94% on SoHuRec-0.6B (noisy tail, rank corr 0.641; set overlap still about 90%).
-  `n = 512` is the mean of the first 3 prompts (HuggingFace OOMs on a longer
-  remaining prompt). Prefer an FP8-trained checkpoint for production FP8 serving.
+beam-set overlap **88–96%** / **88–93%**; prefill top-1 is 100% on SoHuRec-1.7B and
+94% on SoHuRec-0.6B (noisy tail, rank corr 0.641; set overlap still about 90%).
+`n = 512` is the mean of the first 3 prompts (HuggingFace OOMs on a longer
+remaining prompt). Prefer an FP8-trained checkpoint for production FP8 serving.
+
+
 
 ## Supported models
 
@@ -220,7 +210,12 @@ semantic-ID catalog.
 A request is served in the same process that owns the weights and the KV pool:
 HTTP, scheduling, and the model share one address space.
 
-The module layout follows
+![Request path: admission, tokenization, radix prefix hit, batched prefill, SID trie expansion, CUDA-graph decode loop, ranked OpenAI response](assets/architecture-pipeline-en.png)
+
+The pipeline admits requests by longest-prefix-match, tokenizes off the GPU
+path, reuses radix prefix KV, prefills only the miss suffix, scores valid SID
+edges through a fused trie kernel, and decodes inside a CUDA-graph replay.
+Module layout follows
 [mini-sglang](https://github.com/sgl-project/mini-sglang); at runtime the engine
 depends on `sgl-kernel`, `flashinfer_python`, and `triton`. Request path, design
 notes, and module map: [Architecture](docs/architecture.md).
@@ -274,6 +269,8 @@ Numbers: [Numerical match vs HuggingFace](#numerical-match-vs-huggingface).
 - [ ] NVFP4 and native Blackwell storage
 - [ ] Reproducible RecIF coverage across video / ad / product, and published PyPI wheels
 
+
+
 ## Contributing
 
 Contributions are welcome. See [Contributing](CONTRIBUTING.md) for development
@@ -286,7 +283,9 @@ disclosure process in [Security](SECURITY.md).
 - [SGLang](https://github.com/sgl-project/sglang)
 - [mini-sglang](https://github.com/sgl-project/mini-sglang) — layout reference
 - [OpenOneRec](https://github.com/Kuaishou-OneRec/OpenOneRec) (Kuaishou) — OneRec-1.7B and RecIF-Bench
-- [cswuyg/sglang `feature/beam_search_update_0801`](https://github.com/cswuyg/sglang/tree/feature/beam_search_update_0801) — beam semantics alignment and accuracy tests
+- [cswuyg/sglang](https://github.com/cswuyg/sglang/tree/feature/beam_search_update_0801) `feature/beam_search_update_0801` — beam semantics alignment and accuracy tests
+
+
 
 ## Citation
 

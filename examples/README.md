@@ -40,7 +40,7 @@ catalog is built from OneRec RecIF-Bench
 which ships `sid2pid.json`):
 
 ```bash
-DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data bash scripts/build_catalog.sh
+flashrec --catalog /path/to/OpenOneRec-RecIF/benchmark_data
 # writes data/catalogs/sid2pid_beamrec_l4.json
 ```
 

@@ -359,7 +359,16 @@ class DecodeGraphRunner:
         n = int(n_rows)
         if n <= 0 or n > self.capture_bs[-1]:
             return None
-        return self.capture_bs[bisect.bisect_left(self.capture_bs, n)]
+        # Skip buckets whose capture failed: a failed bs would otherwise force
+        # every batch padding into it to run eager forever, even when a larger
+        # bucket captured fine. Before capture() runs, ``graphs`` is empty and
+        # the smallest configured bucket is returned unchanged.
+        if not self.graphs:
+            return self.capture_bs[bisect.bisect_left(self.capture_bs, n)]
+        for bs in self.capture_bs[bisect.bisect_left(self.capture_bs, n) :]:
+            if bs in self.graphs:
+                return bs
+        return None
 
     def can_replay(self, n_rows: int) -> bool:
         bs = self.pad_bs(n_rows)
@@ -444,7 +453,9 @@ class DecodeGraphRunner:
             sl_cpu = batch.seq_lens_cpu.view(-1)[:raw_bs]
             if sl_cpu.device.type != "cpu":
                 sl_cpu = sl_cpu.detach().to("cpu")
-            buf["seq_lens_cpu"][:raw_bs].copy_(sl_cpu.to(dtype=torch.int64))
+            # copy_ converts dtype in place; an explicit .to() would allocate
+            # a CPU temp per step whenever the producer dtype differs.
+            buf["seq_lens_cpu"][:raw_bs].copy_(sl_cpu)
             nidx = int(batch.kv_indices.numel()) if batch.kv_indices is not None else 0
             if nidx > 0:
                 src = batch.kv_indices.view(-1)[:nidx]
@@ -455,18 +466,28 @@ class DecodeGraphRunner:
         else:
             nidx = int(batch.kv_indices.numel()) if batch.kv_indices is not None else 0
         pad = bs - raw_bs
-        if pad > 0:
-            buf["input_ids"][raw_bs:bs].zero_()
-            buf["seq_lens"][raw_bs:bs].fill_(1)
-            buf["seq_lens_cpu"][raw_bs:bs].fill_(1)
-            buf["positions"][raw_bs:bs].zero_()
-            buf["out_loc"][raw_bs:bs].zero_()
-            buf["req_pool"][raw_bs:bs].zero_()
+        # High-water marks: rows past ``dirty_rows`` (and kv entries past
+        # ``kv_dirty``) still hold pad values from a previous replay or from
+        # capture, so re-zeroing them every step would issue ~6 tiny kernels
+        # per replay for nothing. Only the shrink delta needs cleaning.
+        dirty_rows = int(buf.get("dirty_rows", bs))
+        if pad > 0 and dirty_rows > raw_bs:
+            end = min(dirty_rows, bs)
+            buf["input_ids"][raw_bs:end].zero_()
+            buf["seq_lens"][raw_bs:end].fill_(1)
+            buf["seq_lens_cpu"][raw_bs:end].fill_(1)
+            buf["positions"][raw_bs:end].zero_()
+            buf["out_loc"][raw_bs:end].zero_()
+            buf["req_pool"][raw_bs:end].zero_()
+        buf["dirty_rows"] = raw_bs
         total = nidx + pad
-        if pad > 0:
-            buf["kv_indices"][nidx:total].zero_()
+        kv_dirty = int(buf.get("kv_dirty", int(buf["kv_indices"].numel())))
+        if pad > 0 and kv_dirty > nidx:
+            buf["kv_indices"][
+                nidx : max(total, min(kv_dirty, int(buf["kv_indices"].numel())))
+            ].zero_()
+        buf["kv_dirty"] = nidx
         sb.kv_indices = buf["kv_indices"][:total]
-        sb.extend_seq_lens = [1] * bs
         self.attn.begin_graph_decode(bs)
         try:
             prepare_fn(sb)

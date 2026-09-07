@@ -9,6 +9,16 @@ import torch
 
 from flashrec.search.score import beam_score as default_score_fn
 
+# Resolved once at import: a try/import inside expand_token_ids runs per beam
+# step, and a failed kernel import would re-execute (and re-fail) the whole
+# kernel module body on every call.
+try:
+    from flashrec.kernel.beam_trie import (
+        beam_expand_token_ids as _beam_expand_token_ids,
+    )
+except Exception:  # pragma: no cover - kernel unavailable in this env
+    _beam_expand_token_ids = None
+
 
 @dataclass
 class BeamSearchSequence:
@@ -104,14 +114,13 @@ class BeamSearchList:
         parents = parents.clamp(min=0, max=max_parent)
         col = int(self.cur_len)
         if (
-            self.token_ids.is_cuda
+            _beam_expand_token_ids is not None
+            and self.token_ids.is_cuda
             and self.token_ids.dtype == torch.int64
             and col < int(self.token_ids.shape[1])
         ):
             try:
-                from flashrec.kernel.beam_trie import beam_expand_token_ids
-
-                self.token_ids = beam_expand_token_ids(
+                self.token_ids = _beam_expand_token_ids(
                     self.token_ids, parents, toks, col
                 )
                 self.cur_len = col + 1

@@ -43,6 +43,22 @@ def gumbel_like(x: torch.Tensor) -> torch.Tensor:
     return -torch.log(-torch.log(u))
 
 
+# Per-(device, ids) cache for the EOS stop-token tensor: rebuilding it from a
+# Python list is an H2D copy on every decode step of every request.
+_STOP_T_CACHE: dict = {}
+
+
+def _stop_tokens_tensor(
+    stop_token_ids: Sequence[int], device: torch.device
+) -> torch.Tensor:
+    key = (str(device), tuple(int(t) for t in stop_token_ids))
+    t = _STOP_T_CACHE.get(key)
+    if t is None:
+        t = torch.as_tensor(list(key[1]), dtype=torch.int64, device=device)
+        _STOP_T_CACHE[key] = t
+    return t
+
+
 def _map_candidate_tokens(
     idx: torch.Tensor, candidate_token_ids: Optional[torch.Tensor]
 ) -> torch.Tensor:
@@ -226,10 +242,13 @@ def expand_step(
 
     stop_t = None
     if stop_token_ids and not ignore_eos:
-        stop_t = torch.as_tensor(list(stop_token_ids), dtype=torch.int64, device=device)
+        stop_t = _stop_tokens_tensor(stop_token_ids, device)
 
-    step_lp = scores - cum.unsqueeze(1)
     if will_finish:
+        # step_lp only exists on the finish/EOS branches; the no-EOS fast
+        # path below never reads it, so computing it unconditionally would
+        # burn one [n, topk] kernel + allocation per decode step.
+        step_lp = scores - cum.unsqueeze(1)
         sel = select_final_topk(cum, step_lp, tt, beam_width, perturb=perturb)
         beam_list.expand_token_ids(sel.parent_idx, sel.tokens)
         beam_list.cum_logprobs = sel.cum_logprobs

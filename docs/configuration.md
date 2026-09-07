@@ -14,21 +14,25 @@ Leave the catalog unset for an unconstrained smoke test (full-vocabulary
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model-path` | (required) | Model directory (weights + tokenizer). |
+| `--model-path` | (required) | Model directory (weights + tokenizer). Not required with `--catalog`. |
+| `--catalog` | unset | Build a SID catalog from RecIF packed mappings (`benchmark_data` dir or JSON file). Infers layer count; writes `data/catalogs/`. |
+| `--catalog-out` | `data/catalogs` | Catalog output JSON file, or directory when `--catalog` is a data dir. |
+| `--catalog-task` | `video` | `video` / `product` / `both` when `--catalog` is a directory. |
+| `--catalog-levels` | auto | Override inferred SID depth. |
 | `--quantization` | `fp8` | Weight quantization. `fp8` = W8A8 per-channel; `nvfp4` reserved. |
 | `--kv-cache-dtype` | `fp8_e4m3` | KV-cache storage dtype. |
 | `--sid-vocab-file` | unset | Valid-SID catalog (JSON); builds the constraint trie and triggers layout inference. |
 | `--sid` | unset | Optional override `START:END/SIZE,...` for a tokenizer with a different codebook-token naming than `<s_a_0>` / `<\|sid_begin\|>`. |
 | `--system-prompt` / `--system-prompt-file` | unset | Shared system prompt prepended to request messages. |
 | `--warmup-user-a` / `--warmup-user-b` | generic probes | Two distinct user texts whose longest common prefix is pinned in the radix cache. Unset pins chat template + system prompt only. Set both to also pin a shared user-head from your own traffic. |
+| `--warmup-iters` | 10 | Serve mode only: end-to-end warmup generations run after CUDA-graph capture, before the HTTP port opens. `0` disables. |
 
 OpenOneRec RecIF stores SIDs as packed integers in `sid2pid.json` /
 `sid2iid.json`. Convert them to the comma-key JSON `--sid-vocab-file` expects:
 
 ```bash
-bash scripts/build_catalog.sh
-# DATA_DIR=/path/to/benchmark_data TASK=video|product|both LEVELS=4
-python scripts/convert_recif_catalog.py --data-dir /path/to/benchmark_data
+flashrec --catalog /path/to/benchmark_data
+# flashrec --catalog /path/to/benchmark_data --catalog-task both --catalog-out data/catalogs
 ```
 
 Default output is `data/catalogs/sid2pid_beamrec_l4.json` (keys `"a,b,c,1"`).

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Build a py3-none-any wheel, same flow as SGLang's python/ package.
 # Version is BASE+g<shortsha>[.dirty] so the artifact identifies the git commit.
+#
+# pyproject.toml takes version dynamically from flashrec.version.__version__,
+# so this script only stamps version.py (and restores it afterwards). Do not
+# write a static ``version =`` back into pyproject.toml: that field is gone.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 VERSION_FILE="$ROOT/python/flashrec/version.py"
-PYPROJECT="$ROOT/pyproject.toml"
 
 BASE_VERSION="$(sed -n 's/^__version__ = "\([^"+]*\).*/\1/p' "$VERSION_FILE")"
-if [[ -z "${BASE_VERSION}" ]]; then
-  BASE_VERSION="$(sed -n 's/^version = "\([^"+]*\).*/\1/p' "$PYPROJECT")"
-fi
 BASE_VERSION="${BASE_VERSION:-0.1.0}"
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -28,33 +28,12 @@ fi
 echo "Building flashrec==${VERSION} (git ${GIT_HASH})"
 
 VERSION_BAK="$(mktemp)"
-PYPROJECT_BAK="$(mktemp)"
 cp "$VERSION_FILE" "$VERSION_BAK"
-cp "$PYPROJECT" "$PYPROJECT_BAK"
 restore() {
   cp "$VERSION_BAK" "$VERSION_FILE"
-  cp "$PYPROJECT_BAK" "$PYPROJECT"
-  rm -f "$VERSION_BAK" "$PYPROJECT_BAK"
+  rm -f "$VERSION_BAK"
 }
 trap restore EXIT
-
-python3 - "$PYPROJECT" "$VERSION" <<'PY'
-import re
-import sys
-
-path, version = sys.argv[1], sys.argv[2]
-text = open(path, encoding="utf-8").read()
-text, n = re.subn(
-    r'^version\s*=\s*"[^"]*"',
-    f'version = "{version}"',
-    text,
-    count=1,
-    flags=re.M,
-)
-if n != 1:
-    raise SystemExit(f"failed to patch version in {path}")
-open(path, "w", encoding="utf-8").write(text)
-PY
 
 cat > "$VERSION_FILE" <<EOF
 """Package version. Wheel builds stamp __git_commit__ via scripts/build_wheel.sh."""

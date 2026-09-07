@@ -45,15 +45,24 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Resolve the fused kernels once at import. A try/import inside the hot path
+# costs a sys.modules hit per beam per step when it works — and when the
+# kernel module fails to import (Python does not cache failed imports), the
+# whole module body re-executes and re-fails on every call of every step.
+try:
+    from flashrec.kernel.beam_trie import trie_advance_nodes as _trie_advance_nodes
+    from flashrec.kernel.beam_trie import trie_mask_candidates as _trie_mask_candidates
+except Exception:  # pragma: no cover - kernel unavailable in this env
+    _trie_advance_nodes = None
+    _trie_mask_candidates = None
+
 # Sentinel node ids for GPU allow_table rows / unconstrained beams.
 _UNCONSTRAINED_NODE = -1
 
 # Dense allow/next tables cost (nodes+1)*vocab cells each. Beyond this budget
 # (e.g. public 8192^3 catalogs with ~1M internal nodes -> ~25G cells) switch to
 # a sorted-key CSR layout: membership/transition via searchsorted over edges.
-_DENSE_MAX_CELLS = int(
-    os.environ.get("FLASHREC_TRIE_DENSE_MAX_CELLS", str(1 << 29))
-)
+_DENSE_MAX_CELLS = int(os.environ.get("FLASHREC_TRIE_DENSE_MAX_CELLS", str(1 << 29)))
 
 
 @dataclass
@@ -211,17 +220,33 @@ class BeamValidPathTrie:
                 (n_nodes + 1, vsz), self._invalid_node, dtype=torch.int32
             )
             p2n = self._prefix_to_node
+            # Accumulate edges in Python lists and write them with two
+            # vectorized index assignments: a per-cell tensor __setitem__
+            # costs microseconds of dispatch each, i.e. seconds of build
+            # time for a few hundred thousand edges.
+            rows: List[int] = []
+            cols: List[int] = []
+            child_ids: List[int] = []
+            invalid = int(self._invalid_node)
             for prefix, node_id in p2n.items():
                 for tok in self.children.get(prefix, ()):
                     rel = int(tok) - base
                     if 0 <= rel < vsz:
-                        table_cpu[node_id, rel] = True
+                        rows.append(int(node_id))
+                        cols.append(rel)
                         child_key = prefix + (int(tok),)
                         child_id = p2n.get(child_key)
                         if child_id is not None:
-                            next_cpu[node_id, rel] = int(child_id)
+                            child_ids.append(int(child_id))
                         elif len(child_key) >= self.max_depth:
-                            next_cpu[node_id, rel] = _UNCONSTRAINED_NODE
+                            child_ids.append(_UNCONSTRAINED_NODE)
+                        else:
+                            child_ids.append(invalid)
+            if rows:
+                rows_t = torch.tensor(rows, dtype=torch.int64)
+                cols_t = torch.tensor(cols, dtype=torch.int64)
+                table_cpu[rows_t, cols_t] = True
+                next_cpu[rows_t, cols_t] = torch.tensor(child_ids, dtype=torch.int32)
             self._allow_table = table_cpu.to(device, non_blocking=False)
             self._next_node = next_cpu.to(device, non_blocking=False)
             self._csr_keys = None
@@ -471,18 +496,17 @@ class BeamValidPathTrie:
 
         # Fused CUDA path: one kernel instead of sub/clamp/gather/masked_fill.
         if (
-            device.type == "cuda"
+            _trie_mask_candidates is not None
+            and device.type == "cuda"
             and candidate_scores.dtype == torch.float32
             and candidate_tokens.dtype == torch.int64
             and used_nodes.dtype == torch.int64
         ):
             try:
-                from flashrec.kernel.beam_trie import trie_mask_candidates
-
                 scores_in = candidate_scores
                 if not scores_in.is_contiguous():
                     scores_in = scores_in.contiguous()
-                return trie_mask_candidates(
+                return _trie_mask_candidates(
                     scores_in,
                     candidate_tokens.contiguous(),
                     used_nodes.contiguous(),
@@ -533,11 +557,13 @@ class BeamValidPathTrie:
             return torch.where(unconstrained, old, nxt)
         base = int(self.token_base or 0)
         invalid = int(self._invalid_node)
-        if device.type == "cuda" and node_ids.dtype == torch.int64:
+        if (
+            _trie_advance_nodes is not None
+            and device.type == "cuda"
+            and node_ids.dtype == torch.int64
+        ):
             try:
-                from flashrec.kernel.beam_trie import trie_advance_nodes
-
-                return trie_advance_nodes(
+                return _trie_advance_nodes(
                     node_ids,
                     parents,
                     tokens,

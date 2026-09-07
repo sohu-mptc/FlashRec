@@ -1,6 +1,6 @@
-<svg width="860" height="240" viewBox="0 0 860 240" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="FlashRec · mini-sglang">
-  <title>FlashRec · mini-sglang</title>
-  <desc>Wide-beam inference engine for generative recommendation, based on mini-sglang</desc>
+<svg width="860" height="240" viewBox="0 0 860 240" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="FlashRec">
+  <title>FlashRec</title>
+  <desc>Wide-beam inference engine for generative recommendation: SID catalog, CUDA graphs, in-process FP8</desc>
   <defs>
     <linearGradient id="bn-bg" x1="36" y1="36" x2="212" y2="212" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#111c34"/>
@@ -56,6 +56,7 @@
   </g>
 
   <!-- wordmark -->
-  <text x="236" y="118" font-size="64" font-weight="700" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="url(#bn-word)">FlashRec</text>
-  <text x="236" y="154" font-size="18" font-weight="500" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="#94a3b8">wide-beam inference engine</text>
+  <text x="236" y="108" font-size="64" font-weight="700" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="url(#bn-word)">FlashRec</text>
+  <text x="236" y="148" font-size="18" font-weight="500" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="#94a3b8">Wide-beam inference for generative recommendation</text>
+  <text x="236" y="176" font-size="15" font-weight="500" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" fill="#64748b" letter-spacing="0.04em">SID catalog · CUDA graphs · in-process FP8</text>
 </svg>

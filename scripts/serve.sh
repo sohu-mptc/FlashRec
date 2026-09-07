@@ -85,7 +85,7 @@ if [[ -n "${SID_VOCAB_FILE:-}" ]]; then
     fi
     if [[ ! -f "$SID_VOCAB_FILE" ]]; then
         echo "serve.sh: SID_VOCAB_FILE not found: $SID_VOCAB_FILE" >&2
-        echo "  build it with: DATA_DIR=... bash $ROOT/scripts/build_catalog.sh" >&2
+        echo "  build it with: flashrec --catalog /path/to/benchmark_data" >&2
         exit 1
     fi
     SID_ARGS+=(--sid-vocab-file "$SID_VOCAB_FILE")
@@ -105,6 +105,7 @@ fi
 OPTIONAL_ARGS=()
 [[ -n "${BEAM_WIDTH:-}" ]] && OPTIONAL_ARGS+=(--beam-width "$BEAM_WIDTH")
 [[ -n "${MAX_TOKENS:-}" ]] && OPTIONAL_ARGS+=(--max-tokens "$MAX_TOKENS")
+[[ -n "${WARMUP_ITERS:-}" ]] && OPTIONAL_ARGS+=(--warmup-iters "$WARMUP_ITERS")
 [[ -n "${LOG_LEVEL:-}" ]] && OPTIONAL_ARGS+=(--log-level "$LOG_LEVEL")
 
 echo "serve.sh: starting FlashRec on ${HOST:-127.0.0.1}:${PORT:-8000} (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}${SID_VOCAB_FILE:+, catalog=$SID_VOCAB_FILE})"

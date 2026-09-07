@@ -52,7 +52,20 @@ class RestrictedLMHead:
             self._token_ids = torch.tensor(ids, dtype=torch.long, device=device)
             self._weight = None
         if self._weight is None or self._weight.device != device:
-            self._weight = torch.index_select(lm_weight, 0, self._token_ids)
+            ids = self.ids or []
+            lo, hi = int(ids[0]), int(ids[-1])
+            contiguous = (
+                len(ids) > 1
+                and hi - lo == len(ids) - 1
+                and all(b - a == 1 for a, b in zip(ids, ids[1:]))
+            )
+            if contiguous:
+                # SID ids form one contiguous range (sid_layout enforces it):
+                # a zero-copy narrow() view avoids duplicating K x H weight
+                # rows (~hundreds of MB at catalog scale) for process life.
+                self._weight = lm_weight.narrow(0, lo, len(ids))
+            else:
+                self._weight = torch.index_select(lm_weight, 0, self._token_ids)
 
     def _restricted_logprobs(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = F.linear(hidden.to(dtype=self._weight.dtype), self._weight)

@@ -48,9 +48,7 @@ from flashrec.engine.engine import ModelEngine
 from flashrec.scheduler.scheduler import BeamRecEngine
 from flashrec.sid_layout import infer_sid_layout
 
-_DEFAULT_PROMPT = (
-    "predict next: <|sid_begin|><s_a_0><s_b_0><s_c_0><|sid_end|>"
-)
+_DEFAULT_PROMPT = "predict next: <|sid_begin|><s_a_0><s_b_0><s_c_0><|sid_end|>"
 
 
 def _resolve_model_path() -> Optional[str]:
@@ -496,9 +494,7 @@ class _PrefillState:
             os.environ.get("FLASHREC_DIFF_LOGIT_ATOL", default_atol)
         )
         top1_default = "0.0" if self.quantization == "fp8" else "1.0"
-        self.min_top1_agree = float(
-            os.environ.get("FLASHREC_DIFF_TOP1", top1_default)
-        )
+        self.min_top1_agree = float(os.environ.get("FLASHREC_DIFF_TOP1", top1_default))
         self.topk = int(os.environ.get("FLASHREC_DIFF_TOPK", "10"))
         print(
             f"\nSID layout {layout.token_range}/{layout.codebook_sizes} "

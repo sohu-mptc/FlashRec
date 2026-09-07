@@ -95,6 +95,7 @@ class BeamRecEngine:
         self._wave_reqs_key: Optional[tuple] = None
         self._wave_n_rows: int = 0
         self._wave_step: int = 0
+        self._wave_ones: List[int] = []
         depth = int(getattr(self.valid_path, "max_depth", 0) or 0)
         prefs = config.preferred_batch_sizes()
         self.inflight = InflightLoop(
@@ -345,7 +346,12 @@ class BeamRecEngine:
         expand of the finished reqs (SGLang ``beam_copy_stream``).
         """
         out: List[Optional[torch.Tensor]] = []
-        pending: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        # DMA into grow-only pinned staging, then memcpy out after the event:
+        # a fresh torch.empty(pin_memory=True) per tensor is a cudaHostAlloc
+        # on the finalize path (2 per finished request), which lands straight
+        # on tail latency. The post-sync clone() detaches the result from the
+        # staging buffer so the next completion cannot clobber it.
+        pending: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
         for t in tensors:
             if t is None:
                 out.append(None)
@@ -354,15 +360,16 @@ class BeamRecEngine:
             if t.device.type != "cuda":
                 out.append(t)
                 continue
-            host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-            out.append(host)
-            pending.append((host, t))
+            out.append(None)  # filled in after the copy completes
+            pin = self._stage.cpu(f"d2h{len(pending)}", int(t.numel()), t.dtype)
+            pending.append((pin, t, len(out) - 1))
         if not pending:
             return out
         copy_stream = self.pipeline.copy_stream
         if copy_stream is None or not torch.cuda.is_available():
-            for host, src in pending:
-                host.copy_(src)
+            for pin, src, oi in pending:
+                pin.copy_(src.reshape(-1))
+                out[oi] = pin.view(src.shape).clone()
             return out
         if wait_reqs:
             self._wait_reqs_expand_on(copy_stream, wait_reqs)
@@ -370,11 +377,13 @@ class BeamRecEngine:
         if expand is not None:
             copy_stream.wait_stream(expand)
         with torch.cuda.stream(copy_stream):
-            for host, src in pending:
-                host.copy_(src, non_blocking=True)
+            for pin, src, _ in pending:
+                pin.copy_(src.reshape(-1), non_blocking=True)
             done = torch.cuda.Event()
             done.record(copy_stream)
         done.synchronize()
+        for pin, src, oi in pending:
+            out[oi] = pin.view(src.shape).clone()
         return out
 
     def _wait_all_pipeline_events(self) -> None:
@@ -1259,6 +1268,9 @@ class BeamRecEngine:
             self._wave_reqs_key = reqs_key
             self._wave_n_rows = n_rows
             self._wave_step = 0
+            # Reused every decode step of the wave; rebuilding an n_rows-long
+            # Python list per step is pure interpreter churn.
+            self._wave_ones = [1] * n_rows
         step = self._wave_step
         pack = bool(getattr(self.config, "enable_decode_pack", True))
         if not pack:
@@ -1332,7 +1344,7 @@ class BeamRecEngine:
                     out_cache_loc=buf["out_loc"][:raw],
                     is_prefill=False,
                     extend_prefix_lens=None,
-                    extend_seq_lens=[1] * n_rows,
+                    extend_seq_lens=self._wave_ones,
                     kv_indices=kv_indices,
                     buffers_ready=True,
                     want_expand=want_expand,
@@ -1358,7 +1370,7 @@ class BeamRecEngine:
                     out_cache_loc=out_cache,
                     is_prefill=False,
                     extend_prefix_lens=None,
-                    extend_seq_lens=[1] * n_rows,
+                    extend_seq_lens=self._wave_ones,
                     kv_indices=kv_indices,
                 )
             with trace_range(f"flashrec.decode_fwd reqs={len(reqs)}"):
@@ -1461,13 +1473,24 @@ class BeamRecEngine:
                 torch.int64,
                 self.device,
             )
-        for i, r in enumerate(reqs):
-            cum[i].copy_(
-                r.beam_list.cum_logprobs.to(device=self.device, dtype=torch.float32)
-            )
+        cum_rows = [
+            r.beam_list.cum_logprobs.to(device=self.device, dtype=torch.float32)
+            for r in reqs
+        ]
+        if not rows_alias_stack(cum_rows, cum):
+            # One stacked copy instead of n tiny copy_ launches.
+            torch.stack(cum_rows, out=cum)
         self.valid_path._ensure_gpu_cache(self.device)
         cols = [int(r.beam_list.cur_len) for r in reqs]
-        col_t = torch.tensor(cols, dtype=torch.int32, device=self.device)
+        # Pinned staging: torch.tensor(list, device=cuda) is a pageable H2D
+        # that stalls the host behind the in-flight forward on the expand
+        # stream (the graph path already stages "exp_col" the same way).
+        if self.device.type == "cuda":
+            col_t, _ = self._stage.copy_list(
+                "exp_col_eager", cols, self.device, torch.int32
+            )
+        else:
+            col_t = torch.tensor(cols, dtype=torch.int32, device=self.device)
         limits = [self.generation_token_limit(r.max_new_tokens) for r in reqs]
         will_finish = [
             r.beam_list.generated_len() + 1 >= lim for r, lim in zip(reqs, limits)
@@ -1490,8 +1513,11 @@ class BeamRecEngine:
             inplace=False,
             workspace=ws,
         )
+        # One plane clone instead of n per-request clones; rows of the clone
+        # are as safe to hold across steps as individual clones were.
+        vals_owned = fused.vals[:n].clone()
         for i, req in enumerate(reqs):
-            req.beam_list.cum_logprobs = fused.vals[i].clone()
+            req.beam_list.cum_logprobs = vals_owned[i]
             req.beam_list.last_tokens = fused.tokens[i]
             req.beam_list.token_ids = fused.token_ids[i]
             req.beam_list.cur_len = cols[i] + 1
@@ -1577,6 +1603,9 @@ class BeamRecEngine:
             to_free.extend(int(x) for x in full[max_ins:-1])
             ins_tok = ins_tok[:max_ins]
             ins_kv = ins_kv[:max_ins]
+        if ins_tok:
+            canon = self.prefix_cache.insert_cpu(ins_tok, ins_kv)
+            to_free.extend(int(a) for a, b in zip(ins_kv, canon) if int(a) != int(b))
         cap = 49152
         extra = int(self.prefix_cache.num_cached_tokens) - cap
         if extra > 0:
@@ -1585,10 +1614,15 @@ class BeamRecEngine:
             # 200ms+ (the periodic P99 wave). Each completion inserts <=128
             # tokens, so a bounded evict per completion keeps up while capping
             # a single stall at ~1-2ms.
+            #
+            # Evict AFTER re-inserting this request's prefix: the prefix was
+            # just unlocked above, and evicting it first would return its KV
+            # slots to the allocator while insert_cpu below re-creates nodes
+            # that still point at those freed slots (use-after-free on prefix
+            # hits, double-free on later eviction). insert_cpu refreshes
+            # last_access on the whole path, so the fresh prefix is not the
+            # LRU victim here.
             self.prefix_cache.evict(min(extra, 512))
-        if ins_tok:
-            canon = self.prefix_cache.insert_cpu(ins_tok, ins_kv)
-            to_free.extend(int(a) for a, b in zip(ins_kv, canon) if int(a) != int(b))
         if to_free:
             self.runner.free_tokens(to_free)
 

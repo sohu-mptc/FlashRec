@@ -2,9 +2,8 @@
 
 ``flashrec`` is imported directly once the project is installed in editable
 mode (``pip install -e .``), so tests no longer need a ``sys.path`` hack. The
-one exception is ``scripts/``: it is not a package, and
-``tests/test_convert_recif_catalog.py`` imports ``convert_recif_catalog`` from
-it, so we expose that directory here instead of in the test file.
+one exception is ``scripts/``: it is not a package, and tests such as
+``tests/test_eval_beam_matrix.py`` import standalone tools from it.
 """
 
 import sys

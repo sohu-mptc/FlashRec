@@ -75,19 +75,30 @@ def _message_text(content: Union[str, List[Dict[str, Any]]]) -> str:
     return "".join(parts)
 
 
-def _dumps_json(obj: Any) -> bytes:
-    try:
-        import orjson
+# Resolve the serializer once at import: a try/import per call pays the
+# finder machinery on every request when orjson is absent.
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - depends on environment
+    _orjson = None
 
-        return orjson.dumps(obj)
-    except ImportError:
-        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+
+def _dumps_json(obj: Any) -> bytes:
+    if _orjson is not None:
+        return _orjson.dumps(obj)
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def _json_response(payload: Dict[str, Any]) -> Response:
     return Response(content=_dumps_json(payload), media_type="application/json")
+
+
+def _json_response_status(payload: Dict[str, Any], status_code: int) -> Response:
+    return Response(
+        content=_dumps_json(payload),
+        media_type="application/json",
+        status_code=status_code,
+    )
 
 
 def _plain_score(value) -> Optional[float]:
@@ -161,6 +172,9 @@ class _Job:
     ready: threading.Event = field(default_factory=threading.Event)
     error: Optional[BaseException] = None
     enqueued_at: float = field(default_factory=time.monotonic)
+    # Memoized LPM prefix length: select_jobs_lpm rescores the whole queue on
+    # every wake, and each score is a radix walk.
+    prefix_len_cache: Optional[int] = None
 
 
 class BeamRecServer:
@@ -172,6 +186,9 @@ class BeamRecServer:
         self._queue: List[_Job] = []
         self._cv = threading.Condition()
         self._stop = False
+        # Set once the worker finished CUDA-graph capture (or gave up); lets
+        # serve() defer gc.freeze() past capture-time allocations.
+        self._graph_ready = threading.Event()
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
         self.app = FastAPI(title="FlashRec")
@@ -244,6 +261,21 @@ class BeamRecServer:
             for m in request.messages
         ]
         n = max(int(request.n), 1)
+        if n > self.config.resolved_batch_slots():
+            # An oversized n can never fit the slot budget; without this check
+            # the forced-admission fallback would submit it over budget.
+            return _json_response_status(
+                {
+                    "error": {
+                        "message": (
+                            f"n={n} exceeds the beam-row slot budget "
+                            f"({self.config.resolved_batch_slots()})"
+                        ),
+                        "type": "invalid_request_error",
+                    }
+                },
+                400,
+            )
         max_tokens = int(
             request.max_completion_tokens
             or request.max_tokens
@@ -258,9 +290,25 @@ class BeamRecServer:
             max_tokens=max_tokens,
             future=fut,
         )
+        max_q = int(getattr(self.config, "max_queue_len", 0) or 0)
+        with self._cv:
+            if max_q > 0 and len(self._queue) >= max_q:
+                overloaded = True
+            else:
+                overloaded = False
+                self._queue.append(job)
+        if overloaded:
+            return _json_response_status(
+                {
+                    "error": {
+                        "message": "server overloaded: request queue is full",
+                        "type": "overloaded_error",
+                    }
+                },
+                503,
+            )
         self.engine.host_pool.submit(self._tokenize_job, job)
         with self._cv:
-            self._queue.append(job)
             self._cv.notify()
         result: BeamResult = await fut
         if request.stream:
@@ -276,7 +324,12 @@ class BeamRecServer:
                     yield chunk
 
             return StreamingResponse(_gen(), media_type="text/event-stream")
-        return _json_response(self._to_openai(result, request))
+        # Build + serialize off the loop for the same reason as the stream
+        # path: n dicts and one big dumps stall the loop at wide beam.
+        body = await loop.run_in_executor(
+            None, lambda: _dumps_json(self._to_openai(result, request))
+        )
+        return Response(content=body, media_type="application/json")
 
     def _ensure_request(self, job: _Job) -> BeamRequest:
         if job.request is None:
@@ -304,15 +357,22 @@ class BeamRecServer:
             raise job.error
 
     def _job_prefix_len(self, job: _Job) -> int:
-        self._wait_job(job)
-        self._ensure_request(job)
+        # Called under self._cv from the scheduler loop. Never block here:
+        # waiting on tokenization while holding the lock freezes both
+        # scheduling and every HTTP handler that touches the queue. An
+        # unready (or failed) job scores 0 and keeps its FIFO position;
+        # _submit_jobs waits for readiness and surfaces errors later.
+        if not job.ready.is_set() or job.error is not None or job.request is None:
+            return 0
+        if job.prefix_len_cache is not None:
+            return job.prefix_len_cache
         cache = self.engine.prefix_cache
-        if cache is None or job.request is None:
+        if cache is None:
             return 0
         ids = job.request.input_ids
-        if len(ids) <= 1:
-            return 0
-        return int(cache.prefix_len(ids[:-1]))
+        n = 0 if len(ids) <= 1 else int(cache.prefix_len(ids[:-1]))
+        job.prefix_len_cache = n
+        return n
 
     def _pop_queue_locked(
         self, used_slots: int, used_reqs: int, budget: int, soft_admit: int
@@ -365,6 +425,41 @@ class BeamRecServer:
                 if job.request is not None:
                     job_by_rid.pop(job.request.rid, None)
 
+    def _run_warmup_iters(self) -> None:
+        """Run end-to-end warmup generations before the port opens.
+
+        Exercises the full serve path (prefill, beam decode, graph replay,
+        host pool) so the first real request does not pay lazy-init costs.
+        Runs on the worker thread while the HTTP port is still closed, so it
+        never races real traffic.
+        """
+        iters = int(getattr(self.config, "warmup_iters", 0) or 0)
+        if iters <= 0:
+            return
+        logger.info("warmup: running %d generations before opening the port", iters)
+        start = time.monotonic()
+        done = 0
+        for i in range(iters):
+            try:
+                # Distinct prompts defeat radix prefix hits, so every
+                # iteration does a real prefill instead of a cache replay.
+                self.engine.generate(prompt=f"flashrec-warmup-{i}")
+                done += 1
+            except Exception:
+                logger.warning(
+                    "warmup generation %d/%d failed; starting server anyway",
+                    i + 1,
+                    iters,
+                    exc_info=True,
+                )
+                break
+        logger.info(
+            "warmup: %d/%d generations done in %.2fs",
+            done,
+            iters,
+            time.monotonic() - start,
+        )
+
     def _run_worker(self) -> None:
         if self.engine.device.type == "cuda":
             import torch
@@ -374,6 +469,12 @@ class BeamRecServer:
             self.engine.ensure_cuda_graph()
         except Exception:
             logger.exception("CUDA graph capture failed; continuing with eager decode")
+        try:
+            self._run_warmup_iters()
+        finally:
+            # serve() waits on this before binding the port, so warmup always
+            # finishes (or fails) before the first client can connect.
+            self._graph_ready.set()
         wait_s = max(int(self.config.batch_wait_ms), 0) / 1000.0
         wait_max_s = max(int(self.config.batch_wait_max_ms), 0) / 1000.0
         prefs = self.config.preferred_batch_sizes()
@@ -443,17 +544,17 @@ class BeamRecServer:
                         )
                         underfilled = len(jobs) < target_admit and slots < budget
                         if underfilled and adapt_wait > 0:
-                            deadline = time.time() + adapt_wait
+                            deadline = time.monotonic() + adapt_wait
                             extended = False
                             with trace_range(
                                 f"flashrec.batch.wait ms={int(adapt_wait * 1000)} jobs={len(jobs)}"
                             ):
                                 while (
-                                    time.time() < deadline
+                                    time.monotonic() < deadline
                                     and len(jobs) < max(target_admit, 1)
                                     and slots < budget
                                 ):
-                                    remaining = deadline - time.time()
+                                    remaining = deadline - time.monotonic()
                                     if remaining <= 0:
                                         break
                                     if not self._queue:
@@ -476,7 +577,7 @@ class BeamRecServer:
                                         and len(jobs) >= 2
                                         and wait_max_s > adapt_wait
                                     ):
-                                        deadline = time.time() + wait_max_s
+                                        deadline = time.monotonic() + wait_max_s
                                         extended = True
                         k = pack_release_count(
                             len(jobs), recent_batch, target_admit, high_cap
@@ -571,9 +672,7 @@ class BeamRecServer:
             )
 
         def _sse(payload: Dict[str, Any]) -> bytes:
-            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode(
-                "utf-8"
-            )
+            return b"data: " + _dumps_json(payload) + b"\n\n"
 
         return [
             _sse(
@@ -646,10 +745,17 @@ def _tune_gc_after_startup() -> None:
 def serve(config: BeamRecConfig) -> None:
     _install_gc_probe()
     server = BeamRecServer(config)
+    # Freeze only after graph capture + warmup: freezing while the worker is
+    # still inside ensure_cuda_graph() leaves capture-time allocations
+    # unfrozen, so gen-2 passes keep retracing them. The port binds only after
+    # this wait, so warmup always completes before the first request.
+    if not server._graph_ready.wait(timeout=1800.0):
+        logger.warning("CUDA graph capture/warmup still running; tuning GC anyway")
     _tune_gc_after_startup()
     uvicorn.run(
         server.app,
         host=config.host,
         port=int(config.port),
         log_level=config.log_level,
+        access_log=bool(getattr(config, "access_log", False)),
     )

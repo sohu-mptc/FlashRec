@@ -10,7 +10,7 @@ from typing import Dict, Optional, Tuple
 import torch
 from safetensors import safe_open
 
-from flashrec.layers.linear import Linear
+from flashrec.layers.linear import Linear, as_channel_scale
 from flashrec.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,14 @@ def merge_gate_up_weights(
     weight = torch.cat([gate_w, up_w], dim=0)
     scale = None
     if gate_scale is not None and up_scale is not None:
-        scale = torch.cat([gate_scale.reshape(-1), up_scale.reshape(-1)], dim=0)
+        n = int(gate_w.shape[0])
+        scale = torch.cat(
+            [
+                as_channel_scale(gate_scale, n, gate_w.device),
+                as_channel_scale(up_scale, n, up_w.device),
+            ],
+            dim=0,
+        )
     return weight, scale
 
 
@@ -51,7 +58,12 @@ def merge_qkv_weights(
     scale = None
     if q_scale is not None and k_scale is not None and v_scale is not None:
         scale = torch.cat(
-            [q_scale.reshape(-1), k_scale.reshape(-1), v_scale.reshape(-1)], dim=0
+            [
+                as_channel_scale(q_scale, int(q_w.shape[0]), q_w.device),
+                as_channel_scale(k_scale, int(k_w.shape[0]), k_w.device),
+                as_channel_scale(v_scale, int(v_w.shape[0]), v_w.device),
+            ],
+            dim=0,
         )
     return weight, scale
 
@@ -75,7 +87,9 @@ def load_hf_config(model_path: str) -> Qwen3Config:
     )
 
 
-def _iter_safetensors(model_path: str):
+def _iter_safetensors(model_path: str, key_filter=None):
+    """Yield (key, tensor). ``key_filter`` skips keys BEFORE deserializing,
+    so a scales-only pass does not materialize every full weight tensor."""
     root = Path(model_path)
     index = root / "model.safetensors.index.json"
     files = []
@@ -90,7 +104,13 @@ def _iter_safetensors(model_path: str):
         path = root / name
         with safe_open(str(path), framework="pt", device="cpu") as f:
             for key in f.keys():
+                if key_filter is not None and not key_filter(key):
+                    continue
                 yield key, f.get_tensor(key)
+
+
+def _is_scale_key(key: str) -> bool:
+    return key.endswith(".weight_scale") or key.endswith(".weight_scale_inv")
 
 
 def load_weights(
@@ -117,18 +137,15 @@ def load_weights(
     scale_map: Dict[str, torch.Tensor] = {}
     pending_gate_up: Dict[str, Dict[str, torch.Tensor]] = {}
     pending_qkv: Dict[str, Dict[str, torch.Tensor]] = {}
-    for key, tensor in _iter_safetensors(model_path):
-        if key.endswith(".weight_scale") or key.endswith(".weight_scale_inv"):
-            rest = (
-                key[len("model.layers.") :] if key.startswith("model.layers.") else ""
-            )
-            if rest:
-                layer_id_s, _, tail = rest.partition(".")
-                mod_name = f"layers.{layer_id_s}." + tail.rsplit(".", 1)[0]
-                scale_map[mod_name] = tensor.to(device=device)
+    for key, tensor in _iter_safetensors(model_path, key_filter=_is_scale_key):
+        rest = key[len("model.layers.") :] if key.startswith("model.layers.") else ""
+        if rest:
+            layer_id_s, _, tail = rest.partition(".")
+            mod_name = f"layers.{layer_id_s}." + tail.rsplit(".", 1)[0]
+            scale_map[mod_name] = tensor.to(device=device)
 
     for key, tensor in _iter_safetensors(model_path):
-        if key.endswith(".weight_scale") or key.endswith(".weight_scale_inv"):
+        if _is_scale_key(key):
             continue
         t = tensor
         if key == "model.embed_tokens.weight":

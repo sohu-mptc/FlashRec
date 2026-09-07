@@ -4,7 +4,7 @@
 #
 #   DATA_DIR=/path/to/benchmark_data bash scripts/build_catalog.sh
 #   DATA_DIR=/path/to/benchmark_data TASK=both bash scripts/build_catalog.sh
-#   python scripts/convert_recif_catalog.py sid2pid.json out.json --levels 3
+#   flashrec --catalog /path/to/benchmark_data
 #
 set -euo pipefail
 
@@ -14,12 +14,13 @@ PYTHON="${PYTHON:-python3}"
 DATA_DIR="${DATA_DIR:-}"
 OUT_DIR="${OUT_DIR:-$ROOT/data/catalogs}"
 TASK="${TASK:-video}"
-LEVELS="${LEVELS:-4}"
+LEVELS="${LEVELS:-}"
 
 if [[ -z "$DATA_DIR" ]]; then
   echo "DATA_DIR is not set." >&2
   echo "Point it at an OpenOneRec-RecIF benchmark_data directory:" >&2
   echo "  DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data bash $0" >&2
+  echo "Or: flashrec --catalog /path/to/OpenOneRec-RecIF/benchmark_data" >&2
   exit 2
 fi
 
@@ -30,8 +31,8 @@ if [[ ! -d "$DATA_DIR" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
-exec "$PYTHON" "$ROOT/scripts/convert_recif_catalog.py" \
-  --data-dir "$DATA_DIR" \
-  --out-dir "$OUT_DIR" \
-  --task "$TASK" \
-  --levels "$LEVELS"
+cmd=("$PYTHON" -m flashrec --catalog "$DATA_DIR" --catalog-out "$OUT_DIR" --catalog-task "$TASK")
+if [[ -n "$LEVELS" ]]; then
+  cmd+=(--catalog-levels "$LEVELS")
+fi
+exec "${cmd[@]}"
