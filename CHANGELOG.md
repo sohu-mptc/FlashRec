@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-08
+
+Improved decode throughput, added a catalog CLI, and warmed up serving.
+
+### Added
+
+- `flashrec.catalog` module and `flashrec catalog` CLI for building and
+  inspecting SID catalogs from RecIF packed mappings.
+- Serving warm-up so the first request does not pay graph-capture cost.
+- `tests/test_packaging.py` guarding the version/tag consistency check.
+
+### Changed
+
+- Decode path throughput improvements in the CUDA-graph capture and beam
+  expansion (`engine/graph.py`, `search/expand.py`, `search/trie.py`).
+- Server API (`server/api.py`) and scheduler (`scheduler/scheduler.py`)
+  refinements for wave scheduling and decode packing.
+- `scripts/convert_recif_catalog.py` slimmed down; catalog logic moved
+  into `flashrec.catalog`.
+- Banner and architecture assets refreshed.
+
 ## [0.1.0] - 2026-09-02
 
 First public release: an inference engine for generative recommendation,
@@ -35,5 +56,6 @@ wide beam search over a semantic-ID catalog, executed inside CUDA graphs.
 - CPU unit tests, pre-commit hooks, GitHub Actions CI, and a PyPI release
   workflow on `v*` tags.
 
-[Unreleased]: https://github.com/sohu-mptc/FlashRec/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sohu-mptc/FlashRec/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.0
