@@ -430,7 +430,9 @@ def test_beam_search_different_widths(beam_diff_state: _BeamDiffState):
     hf_by_n = {}
     for beam_width in state.beam_widths:
         print(f"\n[HF] generating n={beam_width}", flush=True)
-        hf_by_n[beam_width] = _get_transformers_beam_sequences(input_ids, beam_width)
+        hf_by_n[beam_width] = _get_transformers_beam_sequences(
+            state, input_ids, beam_width
+        )
     state._cached_hf = None
     state._cached_masks = None
     torch.cuda.empty_cache()
@@ -438,7 +440,9 @@ def test_beam_search_different_widths(beam_diff_state: _BeamDiffState):
     mb_by_n = {}
     for beam_width in state.beam_widths:
         print(f"\n[flashrec] generating n={beam_width}", flush=True)
-        mb_by_n[beam_width] = _get_flashrec_beam_sequences(input_ids, beam_width)
+        mb_by_n[beam_width] = _get_flashrec_beam_sequences(
+            state, input_ids, beam_width
+        )
 
     print(f"\n{'n':>5}  {'overlap':>8}  {'top-1':>5}  {'|intersect|':>12}")
     for beam_width in state.beam_widths:
