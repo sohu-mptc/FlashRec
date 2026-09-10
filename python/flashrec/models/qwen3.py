@@ -191,6 +191,9 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.fused_rms_fp8 = bool(fused_rms_fp8)
+        self.fuse_next_norm = False
+        self._next_norm_weight: Optional[nn.Parameter] = None
+        self._next_norm_eps: float = cfg.rms_norm_eps
 
     def _use_fused_quant(self) -> bool:
         return bool(self.fused_rms_fp8 and self.self_attn.qkv_proj._use_fp8)
@@ -200,7 +203,10 @@ class Qwen3DecoderLayer(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor],
         batch: ForwardBatch,
+        input_normed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # FP8 fused path: next-norm fusion not yet supported (would need
+        # cross-layer q_fp8/a_scale passing); fall through to standard FP8.
         if self._use_fused_quant():
             if residual is None:
                 residual = x
@@ -213,14 +219,26 @@ class Qwen3DecoderLayer(nn.Module):
             )
             hidden = self.mlp(hidden, q_fp8=q_fp8, a_scale=a_scale)
             return hidden, residual
-        if residual is None:
+        if input_normed:
+            # x is already normed by the previous layer's fused tail step;
+            # residual carries the pre-norm accumulator.
+            hidden = self.self_attn(x, batch)
+        elif residual is None:
             hidden = self.input_layernorm(x)
             residual = x
+            hidden = self.self_attn(hidden, batch)
         else:
             hidden, residual = self.input_layernorm(x, residual)
-        hidden = self.self_attn(hidden, batch)
+            hidden = self.self_attn(hidden, batch)
         hidden, residual = self.post_attention_layernorm(hidden, residual)
         hidden = self.mlp(hidden)
+        if self.fuse_next_norm and self._next_norm_weight is not None:
+            from flashrec.kernel.sglops import fused_add_rmsnorm
+
+            normed, residual = fused_add_rmsnorm(
+                hidden, residual, self._next_norm_weight, self._next_norm_eps
+            )
+            return normed, residual
         return hidden, residual
 
 
@@ -234,12 +252,14 @@ class Qwen3ForCausalLM(nn.Module):
         fused_rms_fp8: bool = True,
         fused_silu_fp8: bool = True,
         fused_qk_rope_kv: bool = True,
+        fuse_next_norm: bool = False,
     ):
         super().__init__()
         self.cfg = cfg
         self.fused_rms_fp8 = bool(fused_rms_fp8)
         self.fused_silu_fp8 = bool(fused_silu_fp8)
         self.fused_qk_rope_kv = bool(fused_qk_rope_kv)
+        self.fuse_next_norm = bool(fuse_next_norm)
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.rotary = RotaryEmbedding(
             cfg.head_dim, cfg.max_position_embeddings, cfg.rope_theta, device=device
@@ -260,13 +280,42 @@ class Qwen3ForCausalLM(nn.Module):
         )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head_weight: Optional[torch.Tensor] = None
+        if self.fuse_next_norm:
+            self._wire_next_norm()
+        self.to(device=device)
+
+    def _wire_next_norm(self) -> None:
+        n = len(self.layers)
+        for i in range(n - 1):
+            layer = self.layers[i]
+            # FP8 fused quant path doesn't support next-norm fusion yet
+            if layer._use_fused_quant():
+                continue
+            layer.fuse_next_norm = True
+            layer._next_norm_weight = self.layers[i + 1].input_layernorm.weight
+            layer._next_norm_eps = self.layers[i + 1].input_layernorm.eps
         self.to(device=device)
 
     def forward(self, batch: ForwardBatch) -> torch.Tensor:
         x = self.embed_tokens(batch.input_ids)
         residual: Optional[torch.Tensor] = None
+        input_normed = False
         for layer in self.layers:
-            x, residual = layer(x, residual, batch)
+            x, residual = layer(x, residual, batch, input_normed=input_normed)
+            input_normed = (
+                layer.fuse_next_norm and layer._next_norm_weight is not None
+            )
+        if input_normed:
+            # Last fusing layer already applied next-norm; x is normed,
+            # residual is the accumulator. But the final self.norm must still
+            # produce the model's output norm. Since the last layer never has
+            # fuse_next_norm set (no next layer), input_normed here means the
+            # second-to-last layer fused into the last layer's input_layernorm,
+            # and the last layer ran with input_normed=True. The last layer's
+            # fuse_next_norm is False, so this branch is only reached if there's
+            # a single layer edge case. In normal operation the last layer
+            # returns input_normed=False and we go to the else branch.
+            return x
         if residual is None:
             return self.norm(x)
         y, _ = self.norm(x, residual)

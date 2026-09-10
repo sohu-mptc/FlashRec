@@ -146,9 +146,22 @@ class BeamRecConfig:
     enable_prefill_batch: bool = True
     enable_warmup: bool = True
     enable_decode_pack: bool = True
+    # Cascade decode attention: read each request's shared prompt KV once per
+    # decode step instead of once per beam row (FlashInfer multi-level
+    # cascade). Measured on the attention kernel: ~3-4x at beam>=128 with
+    # prompt>=500 tokens, ~2x at beam=50/prompt=1000, slower below ~50 rows.
+    # When enabled, decode tries a dedicated cascade CUDA graph (padded
+    # MultiLevelCascade wrapper); missing/oversized batches stay on eager
+    # cascade. cascade_min_rows gates per batch: batches with fewer total
+    # beam rows keep the paged-graph path.
+    enable_cascade_attention: bool = False
+    cascade_min_rows: int = 128
+    enable_kv_admission: bool = True
     enable_fused_rms_fp8: bool = True
     enable_fused_silu_fp8: bool = True
     enable_fused_qk_rope_kv: bool = True
+    enable_next_norm_fusion: bool = False
+    enable_per_codebook_lm_head: bool = True
     schedule_policy: str = "lpm"
     # Promote jobs waiting longer than this ahead of the LPM prefix ranking.
     # 0 disables aging (pure LPM, which can starve short prompts).

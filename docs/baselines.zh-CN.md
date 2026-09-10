@@ -309,13 +309,17 @@ checkpoint 将 beam 集合重叠恢复到 **88–96%** / **88–93%**。FP8 服�
 
 ## 复现
 
+FlashRec 矩阵（不再自动对照 SGLang）：
+
 ```bash
 DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data bash scripts/build_catalog.sh
 
 MODEL_PATH=/path/to/OneRec-1.7B \
 DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data \
-bash scripts/bench_sglang_compare.sh
+bash benchmark/recif/bench_compare.sh
 ```
+
+下表引擎需手动启动，再用 `python -m flashrec.benchmark.recif --engine <name> …` 打单格。
 
 
 | 引擎           | Beam 入口                                                                                        | 版本                                                                                                                               |
@@ -327,5 +331,5 @@ bash scripts/bench_sglang_compare.sh
 | HuggingFace  | `num_beams` / `num_return_sequences`                                                           | 本机 `transformers`                                                                                                                |
 
 
-单 cell：`python scripts/eval_beam_matrix.py --engine <name> --server-url <url> …`。
-SGLang-master / SGLang 0801 排名结果在 `meta_info.beam_results[]`。
+单 cell：`python -m flashrec.benchmark.recif --engine <name> --server-url <url> …`。
+另见 [`benchmark/`](../benchmark/README.md)。SGLang-master / SGLang 0801 排名结果在 `meta_info.beam_results[]`。

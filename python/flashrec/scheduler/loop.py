@@ -126,6 +126,7 @@ class InflightLoop:
         free_fn: Optional[Callable[[List], None]] = None,
         pack_min: int = 6,
         pack_ratio: float = 0.75,
+        kv_check_fn: Optional[Callable[[int], bool]] = None,
     ):
         self.slots = max(int(slots), 1)
         self.preferred = [int(x) for x in preferred if int(x) > 0] or [8, 16]
@@ -137,6 +138,7 @@ class InflightLoop:
         self.free_fn = free_fn
         self.pack_min = max(int(pack_min), 1)
         self.pack_ratio = float(pack_ratio)
+        self.kv_check_fn = kv_check_fn
         self.beam_width_of = beam_width_of or (lambda r: int(r.beam_width))
         self.generated_len_of = generated_len_of or (
             lambda r: (
@@ -175,7 +177,11 @@ class InflightLoop:
         ):
             return False
         need = int(self.beam_width_of(self.waiting[0]))
-        return self.used_slots() + need <= self.slots
+        if self.used_slots() + need > self.slots:
+            return False
+        if self.kv_check_fn is not None and not self.kv_check_fn(need):
+            return False
+        return True
 
     def _maybe_prefill(self) -> None:
         if not self.wants_prefill():

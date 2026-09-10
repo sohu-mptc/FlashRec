@@ -113,6 +113,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--disable-fused-expand", action="store_true")
     p.add_argument("--disable-graph-expand", action="store_true")
     p.add_argument("--disable-decode-pack", action="store_true")
+    # Wide-beam decode: read the shared prompt KV once per request per step
+    # (multi-level cascade attention). Only batches with at least
+    # --cascade-min-rows beam rows take this path; a cascade CUDA graph is
+    # captured automatically when CUDA graphs are on.
+    p.add_argument("--enable-cascade-attention", action="store_true")
+    p.add_argument("--cascade-min-rows", type=int, default=128)
     p.add_argument("--disable-fused-rms-fp8", action="store_true")
     p.add_argument("--disable-fused-silu-fp8", action="store_true")
     p.add_argument("--disable-fused-qk-rope-kv", action="store_true")
@@ -179,6 +185,8 @@ def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
         enable_fused_expand=not args.disable_fused_expand,
         enable_graph_expand=not args.disable_graph_expand,
         enable_decode_pack=not args.disable_decode_pack,
+        enable_cascade_attention=args.enable_cascade_attention,
+        cascade_min_rows=args.cascade_min_rows,
         enable_fused_rms_fp8=not args.disable_fused_rms_fp8,
         enable_fused_silu_fp8=not args.disable_fused_silu_fp8,
         enable_fused_qk_rope_kv=not args.disable_fused_qk_rope_kv,

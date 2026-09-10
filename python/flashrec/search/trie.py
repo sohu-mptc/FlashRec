@@ -342,6 +342,127 @@ class BeamValidPathTrie:
             (n_nodes + 1) * vsz * 5 / (1024**3),
         )
 
+    def level_node_offsets(self) -> List[int]:
+        """Return the first global node ID at each trie depth.
+
+        Relies on ``finalize_index()`` sorting by ``(len(prefix), prefix)``
+        which guarantees contiguous node-ID ranges per depth.
+        """
+        self._ensure_index()
+        if not self._prefix_to_node:
+            return []
+        max_d = max(len(p) for p in self._prefix_to_node)
+        offsets = [0] * (max_d + 1)
+        for depth in range(max_d + 1):
+            first = None
+            for prefix, nid in self._prefix_to_node.items():
+                if len(prefix) == depth:
+                    if first is None or nid < first:
+                        first = nid
+            offsets[depth] = first if first is not None else 0
+        return offsets
+
+    def level_node_count(self, depth: int) -> int:
+        """Number of trie nodes at a given depth."""
+        self._ensure_index()
+        return sum(1 for p in self._prefix_to_node if len(p) == depth)
+
+    def build_level_tables(
+        self,
+        codebook_sizes: Sequence[int],
+        device: Optional[torch.device] = None,
+    ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]]:
+        """Build per-level dense allow/next tables for CUDA graph capture.
+
+        Returns ``{level: (allow_table, next_node, token_base, cand_ids)}``
+        only for levels whose dense tables fit within ``_DENSE_MAX_CELLS``.
+
+        * ``allow_table [n_level_nodes+1, codebook_k]`` bool
+        * ``next_node   [n_level_nodes+1, codebook_k]`` int32  (global node IDs)
+        * ``token_base`` = original token_base + sum(codebook_sizes[:level])
+        * ``cand_ids    [codebook_k]`` int64  — the level's SID token IDs
+        """
+        self._ensure_index()
+        if self.mode != "trie" or not self._prefix_to_node:
+            return {}
+
+        base = int(self.token_base or 0)
+        p2n = self._prefix_to_node
+        invalid = int(self._invalid_node)
+        max_depth = int(self.max_depth)
+        offsets = self.level_node_offsets()
+        cb = [int(s) for s in codebook_sizes]
+        if device is None:
+            device = self._cache_device or torch.device("cpu")
+
+        result: Dict[int, Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]] = {}
+        cb_offset = 0
+        for d, k in enumerate(cb):
+            n_nodes = self.level_node_count(d)
+            if n_nodes == 0:
+                cb_offset += k
+                continue
+            cells = (n_nodes + 1) * k
+            if cells > _DENSE_MAX_CELLS:
+                logger.info(
+                    "level %d: %d nodes × %d vocab = %d cells > %d — skip dense",
+                    d, n_nodes, k, cells, _DENSE_MAX_CELLS,
+                )
+                cb_offset += k
+                continue
+
+            level_start = offsets[d] if d < len(offsets) else 0
+            level_token_base = base + cb_offset
+
+            table_cpu = torch.zeros((n_nodes + 1, k), dtype=torch.bool)
+            next_cpu = torch.full((n_nodes + 1, k), invalid, dtype=torch.int32)
+
+            rows: List[int] = []
+            cols: List[int] = []
+            child_ids: List[int] = []
+            for prefix, node_id in p2n.items():
+                if len(prefix) != d:
+                    continue
+                local_id = node_id - level_start
+                for tok in self.children.get(prefix, ()):
+                    rel = int(tok) - level_token_base
+                    if not (0 <= rel < k):
+                        continue
+                    rows.append(local_id)
+                    cols.append(rel)
+                    child_key = prefix + (int(tok),)
+                    child_id = p2n.get(child_key)
+                    if child_id is not None:
+                        child_ids.append(int(child_id))
+                    elif len(child_key) >= max_depth:
+                        child_ids.append(_UNCONSTRAINED_NODE)
+                    else:
+                        child_ids.append(invalid)
+
+            if rows:
+                rows_t = torch.tensor(rows, dtype=torch.int64)
+                cols_t = torch.tensor(cols, dtype=torch.int64)
+                table_cpu[rows_t, cols_t] = True
+                next_cpu[rows_t, cols_t] = torch.tensor(child_ids, dtype=torch.int32)
+
+            allow_t = table_cpu.to(device, non_blocking=False)
+            next_t = next_cpu.to(device, non_blocking=False)
+            cand_ids = torch.arange(
+                level_token_base, level_token_base + k, dtype=torch.int64, device=device
+            )
+
+            result[d] = (allow_t, next_t, level_token_base, cand_ids)
+            logger.info(
+                "level %d: dense table ready: nodes=%d vocab=%d token_base=%d (~%.1f MB)",
+                d, n_nodes, k, level_token_base,
+                (table_cpu.numel() + next_cpu.numel() * 4) / (1024 * 1024),
+            )
+            cb_offset += k
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return result
+
     def _csr_lookup(
         self, nodes: torch.Tensor, rel: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -56,8 +56,8 @@ dependencies = [
 [project.optional-dependencies]
 build = ["build", "wheel"]
 dev = ["coverage>=7.0", "pre-commit>=4.0"]
-# pandas is only needed by scripts/eval_beam_matrix.py, not by the engine.
-eval = ["pandas>=2.0"]
+# pandas/aiohttp are only needed by flashrec.benchmark (RecIF / serving), not the engine.
+eval = ["aiohttp>=3.9", "pandas>=2.0"]
 # orjson is an optional fast path in server/api.py; it falls back to json.
 perf = ["orjson>=3.9"]
 
@@ -124,8 +124,7 @@ extend_skip = ["python/flashrec/kernel/include"]
 [tool.pytest.ini_options]
 # ``python/`` is the source tree; exposing it here means the tests import the
 # in-repo package without a per-test sys.path hack or a required editable
-# install. ``scripts/`` is handled by tests/conftest.py because it is not a
-# package (it only holds standalone tools for serving/benchmarking).
+# install. Benchmark clients live under ``flashrec.benchmark``.
 pythonpath = ["python"]
 testpaths = ["tests"]
 addopts = "-ra"

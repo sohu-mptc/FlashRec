@@ -83,6 +83,18 @@ def can_admit_job(
     return True
 
 
+def can_admit_kv(
+    kv_available: int,
+    beam_width: int,
+    max_tokens: int,
+    num_reqs: int = 1,
+    safety_margin: float = 0.95,
+) -> bool:
+    """Check if the KV pool has enough free tokens for the requested work."""
+    need = int(beam_width) * int(max_tokens) * int(num_reqs)
+    return int(kv_available) * float(safety_margin) >= need
+
+
 def group_by_beam_depth(
     reqs: Sequence[T],
     beam_width_of: Callable[[T], int],

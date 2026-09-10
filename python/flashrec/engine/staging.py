@@ -72,7 +72,11 @@ class PinnedStage:
         else:
             dest = dest.view(-1)[:n]
         if n:
-            dest.copy_(pin, non_blocking=True)
+            # Blocking: the pinned slice is reused on the next call. A
+            # non_blocking H2D races with that reuse, and cudaGraphLaunch
+            # does not wait for it — per-level expand then reads a stale
+            # column (s_b written at col 3, decoded as token 0).
+            dest.copy_(pin, non_blocking=False)
         return dest, pin
 
     def copy_rows(
@@ -133,11 +137,11 @@ class PinnedStage:
             off += n
         gpu = self.gpu(name, total, dtype, device)
         if total:
-            gpu.copy_(pin, non_blocking=True)
+            gpu.copy_(pin, non_blocking=False)
         off = 0
         for values, dest in gpu_parts:
             n = len(values)
             d = dest.view(-1)[:n]
             if n and d.data_ptr() != gpu[off : off + n].data_ptr():
-                d.copy_(gpu[off : off + n], non_blocking=True)
+                d.copy_(gpu[off : off + n], non_blocking=False)
             off += n

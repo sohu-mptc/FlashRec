@@ -15,11 +15,12 @@ from flashrec.core import (
     BeamRequest,
     BeamResult,
     BeamSequence,
+    CascadeMeta,
     FinishReason,
     ForwardBatch,
 )
 from flashrec.engine.engine import ModelEngine
-from flashrec.engine.graph import ExpandCaptureSpec
+from flashrec.engine.graph import ExpandCaptureSpec, LevelCaptureSpec
 from flashrec.engine.staging import PinnedStage
 from flashrec.hostpool import HostPool
 from flashrec.kernel.beam_trie import (
@@ -31,7 +32,7 @@ from flashrec.kernel.beam_trie import (
     try_load_beam_trie,
 )
 from flashrec.profiler import trace_range
-from flashrec.scheduler.batching import group_by_beam_depth
+from flashrec.scheduler.batching import can_admit_kv, group_by_beam_depth
 from flashrec.scheduler.kv_remap import remap_by_parents
 from flashrec.scheduler.loop import InflightLoop
 from flashrec.scheduler.pipeline import DecodePipeline
@@ -96,8 +97,25 @@ class BeamRecEngine:
         self._wave_n_rows: int = 0
         self._wave_step: int = 0
         self._wave_ones: List[int] = []
+        # Level-0 cascade arrays (per-request shared prompt pages): constant
+        # within a wave, rebuilt whenever the wave cache misses.
+        self._wave_cascade_l0: Optional[tuple] = None
+        self._wave_cascade_l1: Optional[tuple] = None
+        self._level_node_offsets: Optional[List[int]] = None
+        self._level_tables: Optional[dict] = None
         depth = int(getattr(self.valid_path, "max_depth", 0) or 0)
         prefs = config.preferred_batch_sizes()
+        kv_check_fn = None
+        if bool(getattr(config, "enable_kv_admission", True)):
+            _kv_pool = self.runner.kv_pool
+            _max_tokens = int(config.max_tokens)
+
+            def _kv_ok(beam_width: int) -> bool:
+                return can_admit_kv(
+                    _kv_pool.available_size(), beam_width, _max_tokens
+                )
+
+            kv_check_fn = _kv_ok
         self.inflight = InflightLoop(
             slots=config.resolved_batch_slots(),
             preferred=prefs,
@@ -109,6 +127,7 @@ class BeamRecEngine:
             free_fn=self._free_reqs,
             pack_min=int(getattr(config, "decode_pack_min_requests", 6) or 6),
             pack_ratio=float(getattr(config, "decode_pack_ratio", 0.75) or 0.75),
+            kv_check_fn=kv_check_fn,
         )
         if self.device.type == "cuda":
             self.valid_path._ensure_gpu_cache(self.device)
@@ -138,8 +157,8 @@ class BeamRecEngine:
         spec = self._expand_capture_spec()
         self.runner.ensure_cuda_graph(expand_spec=spec)
         if self.runner.graph is not None:
-            # Replay stays on the capture stream; expand overlaps on expand_stream.
             self.pipeline.ensure_streams()
+            self._capture_level_graphs()
 
     def _expand_capture_spec(self) -> Optional[ExpandCaptureSpec]:
         if not self.config.enable_graph_expand or not self.config.enable_fused_expand:
@@ -179,6 +198,84 @@ class BeamRecEngine:
             token_base=int(vp.token_base or 0),
             invalid_node=int(vp._invalid_node),
         )
+
+    def _capture_level_graphs(self) -> None:
+        """Build per-level LevelCaptureSpecs and capture per-level CUDA graphs."""
+        graph = self.runner.graph
+        if graph is None:
+            return
+        # Recapturing every generate_many rebuilds ~270MB level-1 tables and
+        # recaptures 24+ graphs into the shared pool; the second capture's
+        # first replay already dropped s_b (token 0).
+        if graph.graphs_level:
+            return
+        if not self.runner._per_codebook or not self.runner.lm_head.per_codebook_ready:
+            return
+        vp = self.valid_path
+        if not vp.active or vp.mode != "trie":
+            return
+        if not try_load_beam_trie():
+            return
+        cb = self.config.parsed_codebook_sizes()
+        if not cb:
+            return
+        vp._ensure_gpu_cache(self.device)
+        level_tables = vp.build_level_tables(cb, device=self.device)
+        if not level_tables:
+            return
+        self._level_tables = level_tables
+        self._level_node_offsets = vp.level_node_offsets()
+        bw = int(self.config.beam_width)
+        width = int(self.config.max_tokens)
+        invalid = int(vp._invalid_node)
+        lm_head = self.runner.lm_head
+        model_lm_weight = self.runner.model.lm_head()
+        specs: Dict[int, LevelCaptureSpec] = {}
+        for level, (allow_t, next_t, level_tb, cand_ids) in level_tables.items():
+            k = int(lm_head.codebook_k(level))
+            if k <= 0 or bw <= 0:
+                continue
+            level_weight = lm_head._level_weights[level]
+
+            def _make_logits_fn(w=level_weight):
+                import torch.nn.functional as _F
+
+                def fn(hidden: torch.Tensor, out: torch.Tensor) -> None:
+                    logits = _F.linear(hidden.to(dtype=w.dtype), w)
+                    out.copy_(_F.log_softmax(logits.float(), dim=-1))
+
+                return fn
+
+            allow = allow_t
+            if allow.dtype == torch.bool:
+                allow = allow.view(torch.uint8)
+            nxt = next_t
+            if nxt.dtype != torch.int64:
+                nxt = nxt.to(dtype=torch.int64)
+            espec = ExpandCaptureSpec(
+                beam_width=bw,
+                cand=min(max(bw * 2, bw), k),
+                select_k=bw,
+                width=width,
+                cand_ids=cand_ids.contiguous(),
+                allow_table=allow.contiguous(),
+                next_node=nxt.contiguous(),
+                token_base=int(level_tb),
+                invalid_node=invalid,
+            )
+            specs[level] = LevelCaptureSpec(
+                level=level,
+                logits_fn=_make_logits_fn(),
+                logprobs_k=k,
+                expand_spec=espec,
+            )
+        if specs:
+            with torch.inference_mode():
+                graph.capture_levels(
+                    self.runner._model_fwd,
+                    self.runner.attn.prepare,
+                    specs,
+                )
 
     def _can_graph_expand(self, reqs: List[BeamRequest], n_rows: int) -> bool:
         graph = self.runner.graph
@@ -396,7 +493,8 @@ class BeamRecEngine:
     def generation_token_limit(self, max_new_tokens: int) -> int:
         requested = int(max_new_tokens)
         depth = int(getattr(self.valid_path, "max_depth", 0) or 0)
-        if self.boundary_ids is not None and depth > 0 and requested >= depth + 2:
+        # Catalog SID depth is the last codebook; extra tokens have no slice.
+        if depth > 0 and requested > depth:
             return depth
         return requested
 
@@ -1063,11 +1161,17 @@ class BeamRecEngine:
         logprobs: torch.Tensor,
         cand_ids: Optional[torch.Tensor],
     ) -> None:
+        per_cb = cand_ids is None and self.runner._per_codebook
         offset = 0
         for group in groups:
             n_rows = sum(int(r.beam_width) for r in group)
             sl = logprobs[offset : offset + n_rows]
-            self._expand_decode(group, sl, cand_ids)
+            if per_cb:
+                level = int(group[0].beam_list.generated_len()) if group[0].beam_list is not None else 0
+                lp, cids = self.runner.lm_head_level(sl, level)
+                self._expand_decode(group, lp, cids)
+            else:
+                self._expand_decode(group, sl, cand_ids)
             offset += n_rows
 
     def _ordered_live(
@@ -1271,6 +1375,8 @@ class BeamRecEngine:
             # Reused every decode step of the wave; rebuilding an n_rows-long
             # Python list per step is pure interpreter churn.
             self._wave_ones = [1] * n_rows
+            self._wave_cascade_l0 = None
+            self._wave_cascade_l1 = None
         step = self._wave_step
         pack = bool(getattr(self.config, "enable_decode_pack", True))
         if not pack:
@@ -1293,9 +1399,24 @@ class BeamRecEngine:
         for req in reqs:
             req.seq_len += 1
         graph = self.runner.graph
+        # Cascade decode reads each request's prompt KV once per step instead
+        # of once per beam row. When a cascade CUDA graph was captured for this
+        # padded batch size (and the request count fits the dummy slot), pack
+        # into the static buffers and replay that graph; otherwise eager cascade.
+        cascade_on = (
+            bool(getattr(self.config, "enable_cascade_attention", False))
+            and n_rows >= int(getattr(self.config, "cascade_min_rows", 128))
+            and bool(getattr(self.runner.attn, "supports_cascade", False))
+        )
+        graph_ok = graph is not None and graph.can_replay(n_rows)
+        cascade_graph = (
+            cascade_on
+            and graph_ok
+            and graph.can_replay_cascade(n_rows, len(reqs))
+        )
         packed = (
             graph.buffers_for(n_rows)
-            if graph is not None and graph.can_replay(n_rows)
+            if graph_ok and (not cascade_on or cascade_graph)
             else None
         )
         with torch.inference_mode():
@@ -1333,8 +1454,11 @@ class BeamRecEngine:
                         total=seq_after_total,
                     )
                 want_expand = self._can_graph_expand(reqs, n_rows)
+                if cascade_on and want_expand:
+                    want_expand = graph.can_replay_cascade_expand(n_rows)
                 if want_expand:
                     self._pack_graph_expand(reqs, buf)
+                cascade = self._build_cascade_meta(reqs, n_rows) if cascade_on else None
                 batch = ForwardBatch(
                     input_ids=buf["input_ids"][:raw],
                     req_pool_indices=buf["req_pool"][:raw],
@@ -1348,6 +1472,7 @@ class BeamRecEngine:
                     kv_indices=kv_indices,
                     buffers_ready=True,
                     want_expand=want_expand,
+                    cascade=cascade,
                 )
             else:
                 if pack:
@@ -1361,6 +1486,7 @@ class BeamRecEngine:
                     kv_indices = self.runner.gather_kv_indices(
                         pool_rows, seq_gpu, total=seq_after_total
                     )
+                cascade = self._build_cascade_meta(reqs, n_rows) if cascade_on else None
                 batch = ForwardBatch(
                     input_ids=last_tokens,
                     req_pool_indices=pool_rows,
@@ -1372,9 +1498,254 @@ class BeamRecEngine:
                     extend_prefix_lens=None,
                     extend_seq_lens=self._wave_ones,
                     kv_indices=kv_indices,
+                    cascade=cascade,
                 )
             with trace_range(f"flashrec.decode_fwd reqs={len(reqs)}"):
+                level_result = self._try_level_forward(
+                    reqs, n_rows, pool_rows, out_cache, step, pack, tok_srcs,
+                )
+                if level_result is not None:
+                    return level_result
                 return self.runner.forward(batch)
+
+    def _try_level_forward(
+        self,
+        reqs: List[BeamRequest],
+        n_rows: int,
+        pool_rows: torch.Tensor,
+        out_cache: torch.Tensor,
+        step: int,
+        pack: bool,
+        tok_srcs: List[torch.Tensor],
+    ):
+        """Try per-level CUDA graph (model_fwd + lm_head + expand).
+
+        Returns ``(logprobs, cand_ids, fused)`` on success, or ``None`` to
+        fall through to the base forward path.
+        """
+        graph = self.runner.graph
+        if graph is None or not graph.level_specs:
+            return None
+        if not reqs:
+            return None
+        bw = int(self.config.beam_width)
+        if bw <= 0 or n_rows % bw != 0:
+            return None
+        if len(reqs) != n_rows // bw:
+            return None
+        depths = set()
+        for req in reqs:
+            if int(req.beam_width) != bw:
+                return None
+            if not req.ignore_eos or req.temperature > 0.0:
+                return None
+            bl = req.beam_list
+            if bl is None or bl.node_ids is None or bl.token_ids is None:
+                return None
+            if bl.cum_logprobs is None:
+                return None
+            depths.add(int(bl.generated_len()))
+        if len(depths) != 1:
+            return None
+        level = depths.pop()
+        if not graph.can_replay_level(n_rows, level):
+            return None
+        bs = graph.pad_bs(n_rows)
+        key = (bs, level)
+        buf = graph.static_level.get(key)
+        if buf is None:
+            return None
+        lspec = graph.level_specs[level]
+        width = int(lspec.expand_spec.width)
+        for req in reqs:
+            bl = req.beam_list
+            if int(bl.token_ids.shape[0]) != bw or int(bl.token_ids.shape[-1]) != width:
+                return None
+
+        device = self.device
+        raw = n_rows
+        if pack:
+            self._stage.copy_rows(
+                "dec_tok_lv", tok_srcs, device, torch.int64,
+                dest=buf["input_ids"][:raw],
+            )
+        else:
+            last_tokens = torch.cat(tok_srcs)
+            buf["input_ids"][:raw].copy_(last_tokens.view(-1)[:raw], non_blocking=True)
+        buf["req_pool"][:raw].copy_(pool_rows[:raw], non_blocking=True)
+        buf["out_loc"][:raw].copy_(out_cache.view(-1)[:raw], non_blocking=True)
+        torch.add(self._wave_seq_base[:raw], step, out=buf["positions"][:raw])
+        torch.add(self._wave_seq_base[:raw], step + 1, out=buf["seq_lens"][:raw])
+        buf["seq_lens_cpu"][:raw].copy_(buf["seq_lens"][:raw], non_blocking=True)
+        seq_after_total = self._wave_seq_base_sum + raw * (step + 1)
+        with trace_range(f"flashrec.gather_kv_lv rows={raw}"):
+            kv_indices = self.runner.gather_kv_indices(
+                pool_rows, buf["seq_lens"][:raw],
+                out=buf["kv_indices"], total=seq_after_total,
+            )
+        self._pack_level_expand(reqs, buf, level)
+        batch = ForwardBatch(
+            input_ids=buf["input_ids"][:raw],
+            req_pool_indices=buf["req_pool"][:raw],
+            seq_lens=buf["seq_lens"][:raw],
+            seq_lens_cpu=buf["seq_lens_cpu"][:raw],
+            positions=buf["positions"][:raw],
+            out_cache_loc=buf["out_loc"][:raw],
+            is_prefill=False,
+            extend_prefix_lens=None,
+            extend_seq_lens=self._wave_ones,
+            kv_indices=kv_indices,
+            buffers_ready=True,
+            codebook_level=level,
+        )
+        return self.runner.forward(batch)
+
+    def _pack_level_expand(
+        self, reqs: List[BeamRequest], buf: dict, level: int
+    ) -> None:
+        """Pack expand buffers for per-level graph with node ID remapping."""
+        with trace_range(f"flashrec.pack_level_expand reqs={len(reqs)} level={level}"):
+            n = len(reqs)
+            n_pad = int(buf["exp_n"])
+            device = self.device
+            graph = self.runner.graph
+            torch.stack(
+                [
+                    r.beam_list.cum_logprobs.to(device=device, dtype=torch.float32)
+                    for r in reqs
+                ],
+                out=buf["exp_cum"][:n],
+            )
+            if graph is not None:
+                tok_src, tok_dst, node_src, node_dst = graph.expand_io(buf, n)
+            else:
+                tok_src, tok_dst = buf["exp_tok_in"][:n], buf["exp_tok_out"]
+                node_src, node_dst = buf["exp_nodes"][:n], buf["exp_node_out"]
+            self._detach_plane_aliases(tok_dst, reqs, "token_ids")
+            self._detach_plane_aliases(node_dst, reqs, "node_ids")
+            tok_rows = [
+                r.beam_list.token_ids.to(device=device, dtype=torch.int64) for r in reqs
+            ]
+            if not rows_alias_stack(tok_rows, tok_src):
+                torch.stack(tok_rows, out=tok_src)
+            node_rows = [
+                r.beam_list.node_ids.to(device=device, dtype=torch.int64) for r in reqs
+            ]
+            offset = 0
+            if self._level_node_offsets and level < len(self._level_node_offsets):
+                offset = int(self._level_node_offsets[level])
+            # Local-id remap is in-place on node_src. If that plane is a live
+            # stolen view, subtract would corrupt global node ids held by
+            # beam_list; clone the live rows off the graph plane first.
+            if offset != 0 and rows_alias_stack(node_rows, node_src):
+                for req in reqs:
+                    bl = req.beam_list
+                    if bl is not None and bl.node_ids is not None:
+                        bl.node_ids = bl.node_ids.clone()
+                node_rows = [
+                    r.beam_list.node_ids.to(device=device, dtype=torch.int64)
+                    for r in reqs
+                ]
+            if not rows_alias_stack(node_rows, node_src):
+                torch.stack(node_rows, out=node_src)
+            if offset != 0:
+                valid = node_src[:n] >= 0
+                node_src[:n] = torch.where(valid, node_src[:n] - offset, node_src[:n])
+            cols = [int(r.beam_list.cur_len) for r in reqs]
+            self._stage.copy_list(
+                "exp_col_lv", cols, device, torch.int32, dest=buf["exp_col"][:n]
+            )
+            buf["exp_do"][:n].fill_(1)
+            if n_pad > n:
+                buf["exp_do"][n:n_pad].zero_()
+                buf["exp_col"][n:n_pad].zero_()
+
+    def _build_cascade_meta(
+        self, reqs: List[BeamRequest], n_rows: int
+    ) -> Optional[CascadeMeta]:
+        """Index tables for two-level cascade decode (see ``CascadeMeta``).
+
+        Level 0 (shared prompt pages, identical across a request's beam rows
+        after ``copy_prefill_to_beams``) is keyed on ``prompt_len`` — not the
+        wave-start seq_len, which after a mid-wave rebuild (narrowing) already
+        counts decode steps whose pages are per-beam, not shared. indptr
+        arrays live on CPU (plan is host work); indices stay on GPU.
+
+        Level-1 qo_indptr / last_page_len are constant for a wave (n_rows
+        fixed). kv_indptr is ``arange * dec_len`` when every row shares the
+        same decode depth (lockstep). Prompt-homogeneous waves gather L1
+        pages in one ``index_select``.
+        """
+        table = self.runner.req_pool.req_to_token
+        l0 = self._wave_cascade_l0
+        if l0 is None:
+            qo0 = [0]
+            kv0 = [0]
+            idx0: List[torch.Tensor] = []
+            for req in reqs:
+                rows_cpu = req.beam_pool_indices_cpu
+                if not rows_cpu:
+                    return None
+                pl = int(req.prompt_len)
+                if pl <= 0:
+                    return None
+                qo0.append(qo0[-1] + int(req.beam_width))
+                kv0.append(kv0[-1] + pl)
+                idx0.append(table[int(rows_cpu[0]), :pl])
+            l0 = (
+                torch.tensor(qo0, dtype=torch.int32),
+                torch.tensor(kv0, dtype=torch.int32),
+                torch.cat(idx0).contiguous() if len(idx0) > 1 else idx0[0].contiguous(),
+                torch.ones(len(reqs), dtype=torch.int32),
+            )
+            self._wave_cascade_l0 = l0
+        qo0_t, kv0_t, idx0_t, last0 = l0
+        prompt_lens = [int(r.prompt_len) for r in reqs]
+        dec_lens = [int(r.seq_len) - int(r.prompt_len) for r in reqs]
+        if any(
+            d <= 0 or r.beam_pool_indices is None for d, r in zip(dec_lens, reqs)
+        ):
+            return None
+        l1 = self._wave_cascade_l1
+        if l1 is None or int(l1[0].numel()) != n_rows + 1:
+            l1 = (
+                torch.arange(n_rows + 1, dtype=torch.int32),
+                torch.ones(n_rows, dtype=torch.int32),
+            )
+            self._wave_cascade_l1 = l1
+        qo1_t, last1 = l1
+        same_dec = len(set(dec_lens)) == 1
+        if same_dec:
+            kv1_t = qo1_t * int(dec_lens[0])
+        else:
+            kv1 = [0]
+            for req, d in zip(reqs, dec_lens):
+                base = kv1[-1]
+                kv1.extend(base + d * (i + 1) for i in range(int(req.beam_width)))
+            kv1_t = torch.tensor(kv1, dtype=torch.int32)
+        same_prompt = len(set(prompt_lens)) == 1
+        pool = self._wave_pool_rows
+        if same_dec and same_prompt and pool is not None and int(pool.numel()) >= n_rows:
+            pl = int(prompt_lens[0])
+            d = int(dec_lens[0])
+            rows = pool.view(-1)[:n_rows]
+            if rows.dtype != torch.int64:
+                rows = rows.to(dtype=torch.int64)
+            idx1 = table.narrow(1, pl, d).index_select(0, rows).reshape(-1)
+        else:
+            idx1_parts: List[torch.Tensor] = []
+            for req, pl, d in zip(reqs, prompt_lens, dec_lens):
+                rows = req.beam_pool_indices.view(-1)
+                if rows.dtype != torch.int64:
+                    rows = rows.to(dtype=torch.int64)
+                idx1_parts.append(table.narrow(1, pl, d).index_select(0, rows).reshape(-1))
+            idx1 = torch.cat(idx1_parts) if len(idx1_parts) > 1 else idx1_parts[0]
+        return CascadeMeta(
+            qo_indptr=[qo0_t, qo1_t],
+            kv_indptr=[kv0_t, kv1_t],
+            kv_indices=[idx0_t, idx1],
+            last_page_len=[last0, last1],
+        )
 
     def _expand_decode(
         self,

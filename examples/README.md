@@ -152,5 +152,6 @@ but beam-set overlap still around 90%.
   [Configuration](../docs/configuration.md).
 - Both scripts ship a placeholder prompt so they run as-is; real prompts come
   from your own recommendation stack. OneRec quality (Recall / NDCG /
-  invalid_rate) is [scripts/eval_beam_matrix.py](../scripts/eval_beam_matrix.py).
+  invalid_rate) is [`python -m flashrec.benchmark.recif`](../benchmark/recif/README.md)
+  (shim: [scripts/eval_beam_matrix.py](../scripts/eval_beam_matrix.py)).
   Numerical match vs HuggingFace is the section above, not those retrieval metrics.

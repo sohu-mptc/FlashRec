@@ -79,6 +79,25 @@ class BeamRequest:
 
 
 @dataclass
+class CascadeMeta:
+    """Two-level cascade decode attention (FlashInfer MultiLevelCascade).
+
+    Level 0: one block per request covering its beam rows; kv = the prompt
+    pages every beam of that request shares (columns ``[:prompt_len]`` of
+    ``req_to_token``, identical across rows after ``copy_prefill_to_beams``).
+    Level 1: one block per beam row; kv = that row's own decode-history pages
+    (columns ``[prompt_len:seq_len]``). The prompt KV is thus read once per
+    request instead of once per beam row. indptr tensors are host int32 (plan
+    is a host op); indices tensors are device int32.
+    """
+
+    qo_indptr: List[torch.Tensor]  # [level0, level1]
+    kv_indptr: List[torch.Tensor]
+    kv_indices: List[torch.Tensor]
+    last_page_len: List[torch.Tensor]
+
+
+@dataclass
 class ForwardBatch:
     """One GPU forward. ``n_rows`` is Σ beam slots (decode) or #prompts (prefill)."""
 
@@ -95,6 +114,8 @@ class ForwardBatch:
     kv_indptr: Optional[torch.Tensor] = None
     buffers_ready: bool = False  # decode graph static buffers already filled
     want_expand: bool = False
+    cascade: Optional[CascadeMeta] = None  # decode-only; graph when captured
+    codebook_level: Optional[int] = None  # per-level CUDA graph routing
 
     @property
     def n_rows(self) -> int:

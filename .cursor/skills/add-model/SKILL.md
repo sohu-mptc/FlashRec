@@ -55,7 +55,7 @@ FlashRec 当前 TP=1，唯一模型是 Qwen3（`python/flashrec/models/qwen3.py`
 
 每一轮改动都走同一个闭环，**不优于基线就回退**（"感觉会更快"不算数）：重启 server（当前工作树代码）→ 固定负载压测 → 采 trace → 等 trace 落盘完成。每轮固定 model-path / `--sid-vocab-file` / beam 宽度 / 并发，换了任何一项旧基线就不可复现。生产路径是 `--model-path` + `--sid-vocab-file`，不要把旧 checkpoint 的 token id 写进脚本。
 
-压测用 `scripts/eval_beam_matrix.py`（单格）或 `scripts/run_sglang_flashrec_matrix.sh`（beam × 并发矩阵），起服务见 `scripts/serve.sh` 与 model-deploy skill。
+压测用 `python -m flashrec.benchmark.recif`（单格）或 `benchmark/recif/run_matrix.sh`（beam × 并发矩阵），起服务见 `scripts/serve.sh` 与 model-deploy skill。
 
 采 trace（server 端口按 `PORT`，`serve.sh` 默认 8000）：
 

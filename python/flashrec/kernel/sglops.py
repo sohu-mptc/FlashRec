@@ -8,6 +8,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from flashrec.kernel.selection import KernelCapability, KernelRegistry
+
 logger = logging.getLogger(__name__)
 
 _FP8_MAX = 448.0
@@ -24,6 +26,7 @@ def _try_import():
 
 
 SGL = _try_import()
+_reg = KernelRegistry.get()
 
 # sgl_kernel entry points go through pybind/DLPack; letting dynamo trace into
 # them fails inductor fake-tensor propagation (aten.set_.source_Storage).
@@ -32,7 +35,7 @@ SGL = _try_import()
 
 @torch.compiler.disable
 def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    if SGL is None or not x.is_cuda:
+    if not _reg.using_sgl(KernelCapability.RMSNORM) or not x.is_cuda:
         x_f = x.float()
         var = x_f.pow(2).mean(dim=-1, keepdim=True)
         y = x_f * torch.rsqrt(var + eps)
@@ -50,7 +53,7 @@ def fused_add_rmsnorm(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``residual += x`` then RMSNorm(residual). Mutates both when kernel is used."""
-    if SGL is None or not x.is_cuda:
+    if not _reg.using_sgl(KernelCapability.FUSED_ADD_RMSNORM) or not x.is_cuda:
         residual = residual + x
         return rmsnorm(residual, weight, eps), residual
     hidden = int(weight.numel())
@@ -69,7 +72,7 @@ def apply_rope_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
 ) -> bool:
-    if SGL is None or not query.is_cuda:
+    if not _reg.using_sgl(KernelCapability.ROPE_INPLACE) or not query.is_cuda:
         return False
     SGL.apply_rope_with_cos_sin_cache_inplace(
         positions=positions,
@@ -84,7 +87,7 @@ def apply_rope_inplace(
 @torch.compiler.disable
 def per_token_quant_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     x2 = x.reshape(-1, x.shape[-1]).contiguous()
-    if SGL is not None and x2.is_cuda:
+    if _reg.using_sgl(KernelCapability.PER_TOKEN_QUANT_FP8) and x2.is_cuda:
         q = torch.empty(x2.shape, dtype=torch.float8_e4m3fn, device=x2.device)
         s = torch.empty((x2.shape[0], 1), dtype=torch.float32, device=x2.device)
         SGL.sgl_per_token_quant_fp8(x2, q, s)
@@ -106,7 +109,7 @@ def fp8_scaled_mm(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """a: [M,K] fp8, b: [K,N] fp8, scale_a: [M,1], scale_b: [N]."""
-    if SGL is not None and a_fp8.is_cuda:
+    if _reg.using_sgl(KernelCapability.FP8_SCALED_MM) and a_fp8.is_cuda:
         return SGL.fp8_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
     out = torch._scaled_mm(
         a_fp8,
@@ -144,7 +147,7 @@ def fp8_scaled_mm(
 def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     """SwiGLU: ``silu(x[..., :d]) * x[..., d:]`` with ``d = last_dim // 2``."""
     d = int(x.shape[-1]) // 2
-    if SGL is not None and x.is_cuda:
+    if _reg.using_sgl(KernelCapability.SILU_AND_MUL) and x.is_cuda:
         out = torch.empty(*x.shape[:-1], d, dtype=x.dtype, device=x.device)
         SGL.silu_and_mul(x, out)
         return out
@@ -168,7 +171,7 @@ def apply_rope_and_store_kv(
     FP8 KV plus bf16 activations cannot use the fused path (no k/v scale yet).
     Returns True if KV was written inside the rope kernel.
     """
-    if SGL is None or not query.is_cuda:
+    if not _reg.using_sgl(KernelCapability.ROPE_AND_STORE_KV) or not query.is_cuda:
         return False
     if key.dtype != k_cache.dtype or value.dtype != v_cache.dtype:
         return False
@@ -212,7 +215,7 @@ def store_kv_cache(
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> None:
-    if SGL is not None and k.is_cuda:
+    if _reg.using_sgl(KernelCapability.STORE_KV_CACHE) and k.is_cuda:
         try:
             SGL.set_kv_buffer_kernel(k_cache, v_cache, loc, k, v)
             return

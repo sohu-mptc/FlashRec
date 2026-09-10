@@ -11,7 +11,7 @@ import torch
 from flashrec.attention.flashinfer import AttentionBackend
 from flashrec.config import BeamRecConfig
 from flashrec.core import ForwardBatch
-from flashrec.engine.graph import DecodeGraphRunner, ExpandCaptureSpec
+from flashrec.engine.graph import DecodeGraphRunner, ExpandCaptureSpec, LevelCaptureSpec
 from flashrec.engine.staging import PinnedStage
 from flashrec.kernel.beam_trie import GenrecFusedResult
 from flashrec.kvcache.pool import ReqToTokenPool, TokenToKVPool
@@ -134,6 +134,7 @@ class ModelEngine:
             fused_rms_fp8=bool(getattr(config, "enable_fused_rms_fp8", True)),
             fused_silu_fp8=bool(getattr(config, "enable_fused_silu_fp8", True)),
             fused_qk_rope_kv=bool(getattr(config, "enable_fused_qk_rope_kv", True)),
+            fuse_next_norm=bool(getattr(config, "enable_next_norm_fusion", False)),
         )
         load_weights(
             self.model,
@@ -170,6 +171,23 @@ class ModelEngine:
             self.lm_head.bind(self.model.lm_head())
         except Exception:
             logger.debug("restricted lm_head bind deferred", exc_info=True)
+        self._per_codebook = bool(
+            getattr(config, "enable_per_codebook_lm_head", True)
+        )
+        if self._per_codebook:
+            cb = config.parsed_codebook_sizes()
+            if cb and self.lm_head.ready:
+                self.lm_head.bind_codebook(cb)
+                if self.lm_head.per_codebook_ready:
+                    logger.info(
+                        "per-codebook lm_head: levels=%d max_k=%d",
+                        self.lm_head.num_levels,
+                        self.lm_head.max_codebook_k,
+                    )
+                else:
+                    self._per_codebook = False
+            else:
+                self._per_codebook = False
         self.graph: Optional[DecodeGraphRunner] = None
         self._graph_ready = False
         self.profiler = None
@@ -308,7 +326,14 @@ class ModelEngine:
             return
         torch.cuda.set_device(self.device)
         try:
-            self.attn.init_graph_wrappers(capture_bs, int(self.config.max_seq_len))
+            max_cascade_reqs = 0
+            if getattr(self.config, "enable_cascade_attention", False):
+                max_cascade_reqs = int(self.config.max_batch_requests) + 1
+            self.attn.init_graph_wrappers(
+                capture_bs,
+                int(self.config.max_seq_len),
+                max_cascade_reqs=max_cascade_reqs,
+            )
         except Exception as exc:
             logger.warning("FlashInfer CUDA-graph wrappers failed: %s", exc)
             return
@@ -321,7 +346,7 @@ class ModelEngine:
         )
         logits_fn = None
         logprobs_k = None
-        if self.lm_head.enabled:
+        if self.lm_head.enabled and not self._per_codebook:
             try:
                 self.lm_head.bind(self.model.lm_head())
             except Exception:
@@ -346,8 +371,9 @@ class ModelEngine:
         if runner.graphs:
             self.graph = runner
             logger.info(
-                "CUDA graph ready: captured=%s lm_head=%s k=%s expand=%s",
+                "CUDA graph ready: captured=%s cascade=%s lm_head=%s k=%s expand=%s",
                 sorted(runner.graphs),
+                sorted(runner.graphs_cascade) if runner.graphs_cascade else False,
                 runner.captures_logprobs,
                 logprobs_k,
                 sorted(runner.graphs_expand) if runner.graphs_expand else False,
@@ -364,20 +390,48 @@ class ModelEngine:
             self.profiler.on_forward(is_prefill=bool(batch.is_prefill))
         try:
             with torch.inference_mode():
+                level = getattr(batch, "codebook_level", None)
+                if (
+                    level is not None
+                    and self.graph is not None
+                    and not batch.is_prefill
+                    and self.graph.can_replay_level(batch.n_rows, level)
+                ):
+                    lp, fused = self.graph.replay_level(
+                        batch,
+                        level,
+                        self.attn.prepare,
+                        skip_copy=bool(batch.buffers_ready),
+                    )
+                    lspec = self.graph.level_specs.get(level)
+                    cands = lspec.expand_spec.cand_ids if lspec else None
+                    return None, cands, fused
+
                 use_graph = (
                     self.graph is not None
                     and not batch.is_prefill
                     and self.graph.can_replay(batch.n_rows)
                 )
+                cascade = batch.cascade is not None
+                if cascade and use_graph:
+                    n_reqs = int(batch.cascade.qo_indptr[0].numel()) - 1
+                    use_graph = self.graph.can_replay_cascade(batch.n_rows, n_reqs)
                 if use_graph:
-                    want_expand = bool(getattr(batch, "want_expand", False)) and (
-                        self.graph.can_replay_expand(batch.n_rows)
-                    )
+                    want_expand = bool(getattr(batch, "want_expand", False))
+                    if cascade:
+                        want_expand = want_expand and self.graph.can_replay_cascade_expand(
+                            batch.n_rows
+                        )
+                    else:
+                        want_expand = want_expand and self.graph.can_replay_expand(
+                            batch.n_rows
+                        )
                     out, fused = self.graph.replay(
                         batch,
                         self.attn.prepare,
                         skip_copy=bool(batch.buffers_ready),
                         want_expand=want_expand,
+                        cascade=cascade,
                     )
                     if fused is not None:
                         return None, self.lm_head.token_ids, fused
@@ -391,8 +445,17 @@ class ModelEngine:
                     else:
                         hidden = self.model(batch)
                 last = self.last_token_hidden(hidden, batch)
+                if self._per_codebook and not batch.is_prefill:
+                    return last, None, None
                 logprobs, cands = self.lm_head.compute(last, self.model.lm_head())
                 return logprobs, cands, None
         finally:
             if self.profiler is not None:
                 self.profiler.after_forward(is_prefill=bool(batch.is_prefill))
+
+    def lm_head_level(
+        self, hidden: torch.Tensor, level: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-codebook logprobs for a single decode level."""
+        with torch.inference_mode():
+            return self.lm_head.compute_level(hidden, level)

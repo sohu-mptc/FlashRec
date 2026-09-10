@@ -1,4 +1,4 @@
-from eval_beam_matrix import parse_sglang_generate, uses_sglang_generate
+from flashrec.benchmark.recif import parse_sglang_generate, uses_sglang_generate
 
 
 class TestSglangProtocol:

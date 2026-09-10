@@ -10,15 +10,19 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON="${PYTHON:-python3}"
-# No default: the RecIF dataset lives wherever the operator downloaded it.
+# Prefer operator DATA_DIR; else benchmark/local/data/benchmark_data (gitignored).
 DATA_DIR="${DATA_DIR:-}"
+if [[ -z "$DATA_DIR" && -d "$ROOT/benchmark/local/data/benchmark_data" ]]; then
+  DATA_DIR="$ROOT/benchmark/local/data/benchmark_data"
+fi
 OUT_DIR="${OUT_DIR:-$ROOT/data/catalogs}"
 TASK="${TASK:-video}"
 LEVELS="${LEVELS:-}"
 
 if [[ -z "$DATA_DIR" ]]; then
   echo "DATA_DIR is not set." >&2
-  echo "Point it at an OpenOneRec-RecIF benchmark_data directory:" >&2
+  echo "Point it at an OpenOneRec-RecIF benchmark_data directory, or place it at:" >&2
+  echo "  benchmark/local/data/benchmark_data" >&2
   echo "  DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data bash $0" >&2
   echo "Or: flashrec --catalog /path/to/OpenOneRec-RecIF/benchmark_data" >&2
   exit 2

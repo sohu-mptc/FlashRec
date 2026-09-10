@@ -296,13 +296,18 @@ than post-training quantization of BF16 weights.
 
 ## Reproduction
 
+FlashRec matrix (no automatic SGLang compare):
+
 ```bash
 DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data bash scripts/build_catalog.sh
 
 MODEL_PATH=/path/to/OneRec-1.7B \
 DATA_DIR=/path/to/OpenOneRec-RecIF/benchmark_data \
-bash scripts/bench_sglang_compare.sh
+bash benchmark/recif/bench_compare.sh
 ```
+
+Baseline engines below are started manually; then use
+`python -m flashrec.benchmark.recif --engine <name> …`.
 
 | Engine | Beam entry | Version |
 |---|---|---|
@@ -312,5 +317,5 @@ bash scripts/bench_sglang_compare.sh
 | TensorRT-LLM | `--max_beam_width` == request `best_of` | `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24` |
 | HuggingFace | `num_beams` / `num_return_sequences` | local `transformers` |
 
-Single cell: `python scripts/eval_beam_matrix.py --engine <name> --server-url <url> …`.
-SGLang-master / SGLang 0801 ranked beams are in `meta_info.beam_results[]`.
+Single cell: `python -m flashrec.benchmark.recif --engine <name> --server-url <url> …`.
+See also [`benchmark/`](../benchmark/README.md). SGLang-master / SGLang 0801 ranked beams are in `meta_info.beam_results[]`.
