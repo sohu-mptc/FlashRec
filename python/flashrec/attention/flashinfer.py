@@ -265,6 +265,9 @@ class AttentionBackend:
         n = int(batch.n_rows)
         host_indptr, last_cpu, seq = self._pin.grow(n)
         sl_cpu = batch.seq_lens_cpu.view(-1)[:n]
+        # host_indptr must match the GPU seq_lens used for indptr. A racing
+        # non_blocking D2H here (stale lengths after a prompt-len change)
+        # makes CUDA-graph decode collapse; callers fill seq_lens_cpu on CPU.
         if sl_cpu.device.type == "cpu" and sl_cpu.dtype == torch.int32:
             seq.copy_(sl_cpu)
         else:

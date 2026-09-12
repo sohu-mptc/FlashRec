@@ -6,6 +6,7 @@ from flashrec.search.expand import (
     init_from_prefill,
     init_from_prefill_batch,
     joint_select,
+    narrow_to_codebook_level,
 )
 from flashrec.search.score import beam_score
 from flashrec.search.trie import BeamValidPathTrie
@@ -423,3 +424,47 @@ class TestExpand:
         res = joint_select(cum, lp, toks, stop, beam_width=2)
         assert int(res.num_finished.item()) >= 1
         assert int(res.num_survivors.item()) >= 1
+
+
+class TestNarrowToCodebookLevel:
+    """Full-vocab top-k before trie mask collapses beams; narrow first fixes it."""
+
+    def test_narrow_slices_active_level(self):
+        sizes = [4, 4, 2]
+        cand = torch.arange(sum(sizes), dtype=torch.int64)
+        lp = torch.randn(3, sum(sizes))
+        out_lp, out_ids = narrow_to_codebook_level(lp, cand, sizes, level=1)
+        assert out_lp.shape == (3, 4)
+        assert out_ids.tolist() == [4, 5, 6, 7]
+        torch.testing.assert_close(out_lp, lp[:, 4:8])
+
+    def test_narrow_noop_when_already_per_level(self):
+        cand = torch.arange(8, dtype=torch.int64)
+        lp = torch.randn(2, 8)
+        out_lp, out_ids = narrow_to_codebook_level(lp, cand, [8, 8], level=0)
+        assert out_lp.data_ptr() == lp.data_ptr()
+        assert out_ids.data_ptr() == cand.data_ptr()
+
+    def test_wrong_level_topk_starves_without_narrow(self):
+        """Reproduce SID collapse: wrong-level mass fills top-k."""
+        sizes = [8, 8]
+        total = sum(sizes)
+        bw, cand_k = 4, 8  # beam_candidates = 2 * bw
+        # Level-0 tokens dominate; only 1 level-1 token is in the global top-k.
+        lp = torch.full((bw, total), -20.0)
+        lp[:, :8] = torch.linspace(-0.1, -0.8, 8).unsqueeze(0).expand(bw, -1)
+        lp[:, 8] = -1.0  # sole level-1 token that can enter top-k
+        lp[:, 9:12] = torch.linspace(-2.0, -4.0, 3).unsqueeze(0).expand(bw, -1)
+
+        vals, idx = torch.topk(lp, cand_k, dim=-1)
+        level1_in_pool = (idx >= 8).sum(dim=-1)
+        assert int(level1_in_pool.min()) <= 1
+
+        narrow_lp, narrow_ids = narrow_to_codebook_level(
+            lp, torch.arange(total), sizes, level=1
+        )
+        _nvals, nidx = torch.topk(narrow_lp, min(cand_k, narrow_lp.shape[-1]), dim=-1)
+        tokens = narrow_ids[nidx]
+        assert tokens.shape == (bw, 8)
+        assert bool((tokens >= 8).all())
+        assert int(tokens[0].unique().numel()) == 8

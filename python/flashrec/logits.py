@@ -18,6 +18,9 @@ class RestrictedLMHead:
         self.enabled = bool(enabled and self.ids)
         self._token_ids: Optional[torch.Tensor] = None
         self._weight: Optional[torch.Tensor] = None
+        self._level_weights: Optional[List[torch.Tensor]] = None
+        self._level_token_ids: Optional[List[torch.Tensor]] = None
+        self._codebook_sizes: Optional[List[int]] = None
 
     @property
     def token_ids(self) -> Optional[torch.Tensor]:
@@ -35,11 +38,56 @@ class RestrictedLMHead:
             self.enabled and self._weight is not None and self._token_ids is not None
         )
 
+    @property
+    def per_codebook_ready(self) -> bool:
+        return bool(self._level_weights is not None and len(self._level_weights) > 0)
+
+    @property
+    def num_levels(self) -> int:
+        return len(self._level_weights) if self._level_weights else 0
+
+    @property
+    def max_codebook_k(self) -> int:
+        if not self._codebook_sizes:
+            return 0
+        return max(self._codebook_sizes)
+
+    def codebook_k(self, level: int) -> int:
+        if not self._codebook_sizes or level < 0 or level >= len(self._codebook_sizes):
+            return 0
+        return self._codebook_sizes[level]
+
     def bind(self, lm_weight: torch.Tensor) -> None:
         """Slice restricted rows once after weight load."""
         if lm_weight is None:
             return
         self._ensure(lm_weight.device, lm_weight)
+
+    def bind_codebook(self, codebook_sizes: List[int]) -> None:
+        """Pre-slice per-level weight views from the already-bound ``_weight``.
+
+        Each level's weight is a zero-copy ``narrow()`` view. Must be called
+        after ``bind()``.
+        """
+        if self._weight is None or not self.enabled:
+            return
+        total = sum(codebook_sizes)
+        if total != self._weight.shape[0]:
+            return
+        self._codebook_sizes = list(codebook_sizes)
+        self._level_weights = []
+        self._level_token_ids = []
+        offset = 0
+        ids = self.ids or []
+        device = self._weight.device
+        for size in codebook_sizes:
+            self._level_weights.append(self._weight.narrow(0, offset, size))
+            self._level_token_ids.append(
+                torch.tensor(
+                    ids[offset : offset + size], dtype=torch.long, device=device
+                )
+            )
+            offset += size
 
     def _ensure(self, device: torch.device, lm_weight: torch.Tensor) -> None:
         if not self.enabled:
@@ -70,6 +118,24 @@ class RestrictedLMHead:
     def _restricted_logprobs(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = F.linear(hidden.to(dtype=self._weight.dtype), self._weight)
         return F.log_softmax(logits.float(), dim=-1)
+
+    def compute_level(
+        self, hidden: torch.Tensor, level: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-codebook logprobs: GEMM only against level's weight slice."""
+        weights = self._level_weights
+        ids = self._level_token_ids
+        if weights is None or ids is None or level < 0 or level >= len(weights):
+            # Past last codebook (max_tokens > SID depth): full restricted head.
+            if self._weight is None or self._token_ids is None:
+                raise RuntimeError(
+                    "RestrictedLMHead.compute_level requires bind_codebook()"
+                )
+            return self._restricted_logprobs(hidden), self._token_ids
+        w = weights[level]
+        logits = F.linear(hidden.to(dtype=w.dtype), w)
+        logprobs = F.log_softmax(logits.float(), dim=-1)
+        return logprobs, ids[level]
 
     def compute_into(
         self,

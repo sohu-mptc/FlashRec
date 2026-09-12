@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -19,7 +19,43 @@ __all__ = [
     "expand_step",
     "apply_temperature",
     "gumbel_like",
+    "narrow_to_codebook_level",
 ]
+
+
+def narrow_to_codebook_level(
+    logprobs: torch.Tensor,
+    cand_ids: Optional[torch.Tensor],
+    codebook_sizes: Optional[Sequence[int]],
+    level: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Restrict full restricted-head outputs to one codebook before top-k.
+
+    Expand previously took ``beam_candidates`` from *all* codebook tokens, then
+    applied the trie mask. Wrong-level mass often filled that pool, so after
+    masking too few valid survivors remained and beams collapsed onto duplicate
+    SIDs. Narrowing first keeps every top-k slot inside the active level.
+
+    Ranking within a level is unchanged vs slicing a full-vocab log_softmax
+    (the discarded mass is a per-row constant). No-ops when ``logprobs`` is
+    already per-level width, or when sizes / level are missing.
+    """
+    if (
+        codebook_sizes is None
+        or cand_ids is None
+        or not isinstance(cand_ids, torch.Tensor)
+        or level < 0
+        or level >= len(codebook_sizes)
+    ):
+        return logprobs, cand_ids
+    sizes = [int(s) for s in codebook_sizes]
+    total = sum(sizes)
+    width = int(logprobs.shape[-1])
+    if width != total or int(cand_ids.numel()) != total:
+        return logprobs, cand_ids
+    offset = sum(sizes[:level])
+    k = sizes[level]
+    return logprobs[..., offset : offset + k], cand_ids[offset : offset + k]
 
 
 def apply_temperature(logprobs: torch.Tensor, temperature: float) -> torch.Tensor:
