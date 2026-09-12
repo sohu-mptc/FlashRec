@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-12
+
+Fixed within-request SID collapse under CUDA-graph decode.
+
+### Fixed
+
+- Score each SID codebook level separately (or narrow the restricted head
+  before top-*k*) so wrong-level tokens no longer starve the candidate pool
+  and collapse beams onto duplicate SIDs.
+- Keep FlashInfer `seq_lens_cpu` coherent without racing D2H after prompt-len
+  changes, and ping-pong pinned H2D staging so in-flight DMA cannot corrupt
+  fused-expand SID columns.
+
+### Added
+
+- `enable_per_codebook_lm_head` (default on) and per-level `lm_head` binding
+  in `RestrictedLMHead`.
+
 ## [0.1.1] - 2026-09-08
 
 Improved decode throughput, added a catalog CLI, and warmed up serving.
@@ -56,6 +74,7 @@ wide beam search over a semantic-ID catalog, executed inside CUDA graphs.
 - CPU unit tests, pre-commit hooks, GitHub Actions CI, and a PyPI release
   workflow on `v*` tags.
 
-[Unreleased]: https://github.com/sohu-mptc/FlashRec/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/sohu-mptc/FlashRec/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.2
 [0.1.1]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.0
