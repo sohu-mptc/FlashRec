@@ -38,6 +38,32 @@ class TestGatherAndPool:
         assert gpu.data_ptr() == dest[:3].data_ptr()
         assert pin.data_ptr() == dest[:3].data_ptr()
 
+    def test_copy_list_pin_reuse_survives_async_h2d(self):
+        """Refilling the pin before a prior H2D finishes must not corrupt GPU.
+
+        Fused expand stages per-step ``col`` through this path; without
+        ping-pong + wait, the next fill overwrites the in-flight DMA source and
+        the SID middle token is written into the wrong column (stays 0).
+        """
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from flashrec.engine.staging import PinnedStage
+
+        st = PinnedStage()
+        device = torch.device("cuda:0")
+        # Capture each transfer into its own dest so we can check after sync.
+        captured = []
+        for i in range(32):
+            dest = torch.empty(1, dtype=torch.int32, device=device)
+            st.copy_list("exp_col_eager", [i], device, torch.int32, dest=dest)
+            captured.append(dest)
+        torch.cuda.synchronize()
+        assert [int(t.item()) for t in captured] == list(range(32))
+        # Consecutive calls must alternate pin slots.
+        assert st._pin_epoch["exp_col_eager"] == 32
+        assert "exp_col_eager#pin0" in st._cpu
+        assert "exp_col_eager#pin1" in st._cpu
+
     def test_copy_rows_skips_cat(self):
         from flashrec.engine.staging import PinnedStage
 

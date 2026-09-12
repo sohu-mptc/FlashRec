@@ -27,7 +27,8 @@ Usage::
 Optional env:
   FLASHREC_DIFF_MODEL    model dir (required; test skips when unset)
   FLASHREC_DIFF_PROMPT   user text for chat template (default: short GenRec-like prompt)
-  FLASHREC_DIFF_CATALOG  sid-vocab JSON; omit for codebook-only (not trie) constraint
+  FLASHREC_DIFF_CATALOG  sid-vocab JSON; when set, both FlashRec and HF apply
+                         codebook + trie (omit for codebook-only)
   FLASHREC_DIFF_QUANT    ``fp8`` (default, production path) or ``bf16`` (tighter HF match)
   FLASHREC_DIFF_BEAMS    comma-separated beam widths (default ``4,8``)
 """
@@ -46,6 +47,7 @@ from flashrec.config import BeamRecConfig, parse_int_list
 from flashrec.core import ForwardBatch
 from flashrec.engine.engine import ModelEngine
 from flashrec.scheduler.scheduler import BeamRecEngine
+from flashrec.search.trie import BeamValidPathTrie, build_beam_valid_path
 from flashrec.sid_layout import infer_sid_layout
 
 _DEFAULT_PROMPT = "predict next: <|sid_begin|><s_a_0><s_b_0><s_c_0><|sid_end|>"
@@ -63,9 +65,13 @@ def _resolve_model_path() -> Optional[str]:
     return str(path)
 
 
+def _catalog_path() -> Optional[str]:
+    raw = os.environ.get("FLASHREC_DIFF_CATALOG", "").strip()
+    return raw or None
+
+
 def _sid_layout_for(model_path: str):
-    catalog = os.environ.get("FLASHREC_DIFF_CATALOG", "").strip() or None
-    return infer_sid_layout(model_path, catalog)
+    return infer_sid_layout(model_path, _catalog_path())
 
 
 def _quantization() -> str:
@@ -229,10 +235,12 @@ class _BeamDiffState:
         self._cached_flashrec = None
         self._cached_tok = None
         self._cached_masks = None
+        self._cached_trie = None
+        catalog = _catalog_path()
         print(
             f"\nSID layout {layout.token_range}/{layout.codebook_sizes} "
             f"boundary {layout.boundary_tokens} quant={self.quantization} "
-            f"beams={self.beam_widths}"
+            f"beams={self.beam_widths} catalog={catalog or '(codebook-only)'}"
         )
 
     def release(self):
@@ -240,6 +248,7 @@ class _BeamDiffState:
         self._cached_flashrec = None
         self._cached_tok = None
         self._cached_masks = None
+        self._cached_trie = None
         torch.cuda.empty_cache()
 
 
@@ -304,8 +313,7 @@ def _flashrec_engine(state: _BeamDiffState) -> BeamRecEngine:
                 sid_token_range=state.sid_token_range,
                 sid_codebook_sizes=state.codebook_sizes_s,
                 sid_boundary_tokens=state.boundary_s,
-                sid_vocab_file=os.environ.get("FLASHREC_DIFF_CATALOG", "").strip()
-                or None,
+                sid_vocab_file=_catalog_path(),
                 beam_width=max_n,
                 max_tokens=state.depth + 2,
                 length_penalty=1.0,
@@ -338,6 +346,52 @@ def _codebook_masks(state: _BeamDiffState, vocab_size: int) -> List[torch.Tensor
     return masks
 
 
+def _valid_path(state: _BeamDiffState) -> BeamValidPathTrie:
+    if state._cached_trie is not None:
+        return state._cached_trie
+    catalog = _catalog_path()
+    if not catalog:
+        state._cached_trie = BeamValidPathTrie(mode="none")
+        return state._cached_trie
+    trie = build_beam_valid_path(
+        sid_file=catalog,
+        codebook_sizes=state.codebook_sizes,
+        special_token_ids=state.special_ids,
+    )
+    print(
+        f"valid_path mode={trie.mode} depth={trie.max_depth} file={catalog}",
+        flush=True,
+    )
+    state._cached_trie = trie
+    return trie
+
+
+def _apply_trie_mask(
+    trie: BeamValidPathTrie,
+    input_ids_t: torch.Tensor,
+    scores: torch.Tensor,
+    prompt_len: int,
+    step: int,
+) -> torch.Tensor:
+    """Mask tokens that do not continue a valid SID prefix (same as FlashRec)."""
+    if trie.mode != "trie":
+        return scores
+    neg = torch.finfo(scores.dtype).min
+    scores = scores.clone()
+    for i in range(int(input_ids_t.shape[0])):
+        prefix = input_ids_t[i, prompt_len : prompt_len + step].tolist()
+        allowed = trie.allowed_next(prefix)
+        if allowed is None:
+            continue
+        if not allowed:
+            scores[i].fill_(neg)
+            continue
+        keep = torch.zeros(scores.shape[-1], dtype=torch.bool, device=scores.device)
+        keep[torch.tensor(list(allowed), dtype=torch.long, device=scores.device)] = True
+        scores[i] = torch.where(keep, scores[i], torch.full_like(scores[i], neg))
+    return scores
+
+
 def _get_transformers_beam_sequences(
     state: _BeamDiffState, input_ids: List[int], beam_width: int
 ) -> List[str]:
@@ -348,12 +402,14 @@ def _get_transformers_beam_sequences(
     depth = state.depth
     pad_id = int(getattr(model.config, "eos_token_id", 0) or 0)
     masks = _codebook_masks(state, int(model.config.vocab_size))
+    trie = _valid_path(state)
 
     class _StepMask(LogitsProcessor):
         def __call__(self, input_ids_t: torch.Tensor, scores: torch.Tensor):
             step = int(input_ids_t.shape[-1]) - prompt_len
             if 0 <= step < depth:
-                return scores + masks[step]
+                scores = scores + masks[step]
+                return _apply_trie_mask(trie, input_ids_t, scores, prompt_len, step)
             scores = scores.clone()
             scores.fill_(torch.finfo(scores.dtype).min)
             scores[:, pad_id] = 0.0
@@ -430,7 +486,9 @@ def test_beam_search_different_widths(beam_diff_state: _BeamDiffState):
     hf_by_n = {}
     for beam_width in state.beam_widths:
         print(f"\n[HF] generating n={beam_width}", flush=True)
-        hf_by_n[beam_width] = _get_transformers_beam_sequences(input_ids, beam_width)
+        hf_by_n[beam_width] = _get_transformers_beam_sequences(
+            state, input_ids, beam_width
+        )
     state._cached_hf = None
     state._cached_masks = None
     torch.cuda.empty_cache()
@@ -438,7 +496,7 @@ def test_beam_search_different_widths(beam_diff_state: _BeamDiffState):
     mb_by_n = {}
     for beam_width in state.beam_widths:
         print(f"\n[flashrec] generating n={beam_width}", flush=True)
-        mb_by_n[beam_width] = _get_flashrec_beam_sequences(input_ids, beam_width)
+        mb_by_n[beam_width] = _get_flashrec_beam_sequences(state, input_ids, beam_width)
 
     print(f"\n{'n':>5}  {'overlap':>8}  {'top-1':>5}  {'|intersect|':>12}")
     for beam_width in state.beam_widths:
@@ -499,7 +557,7 @@ class _PrefillState:
         print(
             f"\nSID layout {layout.token_range}/{layout.codebook_sizes} "
             f"boundary {layout.boundary_tokens} quant={self.quantization} "
-            f"atol={self.max_abs_diff}"
+            f"atol={self.max_abs_diff} catalog={_catalog_path() or '(codebook-only)'}"
         )
 
 
@@ -534,7 +592,7 @@ def _build_runner(state: _PrefillState) -> ModelEngine:
         sid_token_range=state.sid_token_range,
         sid_codebook_sizes=state.codebook_sizes_s,
         sid_boundary_tokens=state.boundary_s,
-        sid_vocab_file=os.environ.get("FLASHREC_DIFF_CATALOG", "").strip() or None,
+        sid_vocab_file=_catalog_path(),
         enable_cuda_graph=False,
         enable_graph_expand=False,
         enable_radix=False,

@@ -170,6 +170,21 @@ class ModelEngine:
             self.lm_head.bind(self.model.lm_head())
         except Exception:
             logger.debug("restricted lm_head bind deferred", exc_info=True)
+        self._per_codebook = bool(getattr(config, "enable_per_codebook_lm_head", True))
+        if self._per_codebook:
+            cb = config.parsed_codebook_sizes()
+            if cb and self.lm_head.ready:
+                self.lm_head.bind_codebook(cb)
+                if self.lm_head.per_codebook_ready:
+                    logger.info(
+                        "per-codebook lm_head: levels=%d max_k=%d",
+                        self.lm_head.num_levels,
+                        self.lm_head.max_codebook_k,
+                    )
+                else:
+                    self._per_codebook = False
+            else:
+                self._per_codebook = False
         self.graph: Optional[DecodeGraphRunner] = None
         self._graph_ready = False
         self.profiler = None
@@ -321,7 +336,10 @@ class ModelEngine:
         )
         logits_fn = None
         logprobs_k = None
-        if self.lm_head.enabled:
+        # Per-codebook decode scores each SID level separately after the model
+        # forward; embedding a full-vocab lm_head into the CUDA graph would
+        # bypass that and reintroduce within-request SID collapse.
+        if self.lm_head.enabled and not self._per_codebook:
             try:
                 self.lm_head.bind(self.model.lm_head())
             except Exception:
@@ -391,8 +409,17 @@ class ModelEngine:
                     else:
                         hidden = self.model(batch)
                 last = self.last_token_hidden(hidden, batch)
+                if self._per_codebook and not batch.is_prefill:
+                    return last, None, None
                 logprobs, cands = self.lm_head.compute(last, self.model.lm_head())
                 return logprobs, cands, None
         finally:
             if self.profiler is not None:
                 self.profiler.after_forward(is_prefill=bool(batch.is_prefill))
+
+    def lm_head_level(
+        self, hidden: torch.Tensor, level: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-codebook logprobs for a single decode level."""
+        with torch.inference_mode():
+            return self.lm_head.compute_level(hidden, level)

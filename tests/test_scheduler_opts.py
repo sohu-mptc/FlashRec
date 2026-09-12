@@ -1,5 +1,8 @@
+import torch
+
 from flashrec.config import BeamRecConfig
 from flashrec.core import BeamResult, BeamSequence
+from flashrec.engine.staging import fill_cpu_seq_lens
 from flashrec.hostpool import HostPool
 from flashrec.scheduler.batching import (
     batch_wait_seconds,
@@ -730,3 +733,13 @@ class TestHostPool:
         pool.flush()
         assert seen == [7]
         pool.shutdown()
+
+
+class TestFillCpuSeqLens:
+    def test_overwrites_stale_short_wave(self):
+        dest = torch.tensor([3, 3, 3], dtype=torch.int64)
+        base = torch.tensor([100, 100, 80], dtype=torch.int64)
+        fill_cpu_seq_lens(dest, base, step=0)
+        assert dest.tolist() == [101, 101, 81]
+        fill_cpu_seq_lens(dest, base, step=2)
+        assert dest.tolist() == [103, 103, 83]

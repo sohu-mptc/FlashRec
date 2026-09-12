@@ -452,6 +452,7 @@ class DecodeGraphRunner:
             )
             sl_cpu = batch.seq_lens_cpu.view(-1)[:raw_bs]
             if sl_cpu.device.type != "cpu":
+                # Blocking D2H: FlashInfer plan() reads seq_lens_cpu immediately.
                 sl_cpu = sl_cpu.detach().to("cpu")
             # copy_ converts dtype in place; an explicit .to() would allocate
             # a CPU temp per step whenever the producer dtype differs.

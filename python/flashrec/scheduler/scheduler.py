@@ -20,7 +20,7 @@ from flashrec.core import (
 )
 from flashrec.engine.engine import ModelEngine
 from flashrec.engine.graph import ExpandCaptureSpec
-from flashrec.engine.staging import PinnedStage
+from flashrec.engine.staging import PinnedStage, fill_cpu_seq_lens
 from flashrec.hostpool import HostPool
 from flashrec.kernel.beam_trie import (
     GenrecFusedResult,
@@ -41,6 +41,7 @@ from flashrec.search.expand import (
     expand_step,
     init_from_prefill,
     init_from_prefill_batch,
+    narrow_to_codebook_level,
 )
 from flashrec.search.score import beam_score
 from flashrec.search.trie import build_beam_valid_path
@@ -91,6 +92,7 @@ class BeamRecEngine:
         self._last_prefill_ev = None
         self._wave_pool_rows: Optional[torch.Tensor] = None
         self._wave_seq_base: Optional[torch.Tensor] = None
+        self._wave_seq_base_cpu: Optional[torch.Tensor] = None
         self._wave_seq_base_sum: int = 0
         self._wave_reqs_key: Optional[tuple] = None
         self._wave_n_rows: int = 0
@@ -929,6 +931,10 @@ class BeamRecEngine:
             )
         return out
 
+    def _codebook_sizes(self) -> Optional[List[int]]:
+        sizes = self.config.parsed_codebook_sizes()
+        return list(sizes) if sizes else None
+
     def _init_wave_precompute(
         self,
         prepared: List[tuple],
@@ -961,6 +967,11 @@ class BeamRecEngine:
                 or limit <= 1
             ):
                 return None
+        # Prefill seeds beam 0 from codebook 0 only — same collapse hazard as
+        # decode when wrong-level tokens dominate a full-vocab top-k.
+        logprobs, cand_ids = narrow_to_codebook_level(
+            logprobs, cand_ids, self._codebook_sizes(), level=0
+        )
         bls = init_from_prefill_batch(
             logprobs,
             beam_width=bw,
@@ -1027,6 +1038,9 @@ class BeamRecEngine:
             req.expanded = True
             return
         limit = self.generation_token_limit(req.max_new_tokens)
+        logprobs, cand_ids = narrow_to_codebook_level(
+            logprobs, cand_ids, self._codebook_sizes(), level=0
+        )
         req.beam_list = init_from_prefill(
             logprobs,
             beam_width=req.beam_width,
@@ -1063,11 +1077,21 @@ class BeamRecEngine:
         logprobs: torch.Tensor,
         cand_ids: Optional[torch.Tensor],
     ) -> None:
+        per_cb = cand_ids is None and getattr(self.runner, "_per_codebook", False)
+        cb_sizes = None if per_cb else self._codebook_sizes()
         offset = 0
         for group in groups:
             n_rows = sum(int(r.beam_width) for r in group)
             sl = logprobs[offset : offset + n_rows]
-            self._expand_decode(group, sl, cand_ids)
+            bl = group[0].beam_list if group else None
+            level = int(bl.generated_len()) if bl is not None else 0
+            if per_cb:
+                lp, cids = self.runner.lm_head_level(sl, level)
+            else:
+                # Full restricted head fallback: narrow to the active codebook
+                # before top-k so wrong-level tokens cannot starve the pool.
+                lp, cids = narrow_to_codebook_level(sl, cand_ids, cb_sizes, level)
+            self._expand_decode(group, lp, cids)
             offset += n_rows
 
     def _ordered_live(
@@ -1259,11 +1283,12 @@ class BeamRecEngine:
             seq_base: List[int] = []
             for req in reqs:
                 seq_base.extend([int(req.seq_len)] * int(req.beam_width))
-            seq_base_gpu, _ = self._stage.copy_list(
+            seq_base_gpu, seq_base_cpu = self._stage.copy_list(
                 "_wave_base", seq_base, device, torch.int64
             )
             self._wave_pool_rows = pool_rows
             self._wave_seq_base = seq_base_gpu
+            self._wave_seq_base_cpu = seq_base_cpu
             self._wave_seq_base_sum = int(sum(seq_base))
             self._wave_reqs_key = reqs_key
             self._wave_n_rows = n_rows
@@ -1321,8 +1346,12 @@ class BeamRecEngine:
                 torch.add(
                     self._wave_seq_base[:raw], step + 1, out=buf["seq_lens"][:raw]
                 )
-                buf["seq_lens_cpu"][:raw].copy_(
-                    buf["seq_lens"][:raw], non_blocking=True
+                # CPU seq_lens for FlashInfer plan must not D2H the GPU write:
+                # plan() reads host_indptr immediately, and a stale copy after a
+                # prompt-len change collapses CUDA-graph decode.
+                assert self._wave_seq_base_cpu is not None
+                fill_cpu_seq_lens(
+                    buf["seq_lens_cpu"][:raw], self._wave_seq_base_cpu[:raw], step
                 )
                 seq_after_total = self._wave_seq_base_sum + raw * (step + 1)
                 with trace_range(f"flashrec.gather_kv rows={raw}"):
@@ -1485,6 +1514,8 @@ class BeamRecEngine:
         # Pinned staging: torch.tensor(list, device=cuda) is a pageable H2D
         # that stalls the host behind the in-flight forward on the expand
         # stream (the graph path already stages "exp_col" the same way).
+        # PinnedStage ping-pongs pins so a later fill cannot corrupt an
+        # in-flight non_blocking H2D (that bug wrote SID column 1 as 0).
         if self.device.type == "cuda":
             col_t, _ = self._stage.copy_list(
                 "exp_col_eager", cols, self.device, torch.int32

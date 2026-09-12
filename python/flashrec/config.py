@@ -141,6 +141,11 @@ class BeamRecConfig:
     enable_radix: bool = True
     enable_cuda_graph: bool = True
     enable_restricted_lm_head: bool = True
+    # Score only the active codebook at each SID depth. Without this, top-k
+    # over the full restricted head is often filled by wrong-level tokens;
+    # after the trie mask too few valid survivors remain and beams collapse
+    # into duplicate SIDs within one request.
+    enable_per_codebook_lm_head: bool = True
     enable_fused_expand: bool = True
     enable_graph_expand: bool = True
     enable_prefill_batch: bool = True
