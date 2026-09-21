@@ -9,6 +9,7 @@ tvm-ffi / CUDA is available. JIT includes live under ``kernel/include/``
 from __future__ import annotations
 
 import logging
+import os
 from typing import NamedTuple, Optional, Sequence, Union
 
 import torch
@@ -58,6 +59,8 @@ def _try_module():
             "TVM_FFI_DLL_EXPORT_TYPED_FUNC(trie_advance_nodes, (trie_advance_nodes));",
             "TVM_FFI_DLL_EXPORT_TYPED_FUNC(beam_expand_token_ids, (beam_expand_token_ids));",
             "TVM_FFI_DLL_EXPORT_TYPED_FUNC(genrec_mask_topk_expand, (genrec_mask_topk_expand));",
+            "TVM_FFI_DLL_EXPORT_TYPED_FUNC(genrec_score_mask, (genrec_score_mask));",
+            "TVM_FFI_DLL_EXPORT_TYPED_FUNC(genrec_expand_advance, (genrec_expand_advance));",
         ]
         includes = _jit_include_dirs()
         cflags = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "--use_fast_math"]
@@ -178,8 +181,13 @@ def trie_advance_nodes_batched(
     n, bw = int(node_ids.shape[0]), int(node_ids.shape[1])
     vsz = int(next_node.shape[1])
     par = parents.to(device=node_ids.device, dtype=torch.int64).clamp(0, max(bw - 1, 0))
-    toks = tokens.to(device=node_ids.device, dtype=torch.int64)
-    batch_idx = torch.arange(n, device=node_ids.device).unsqueeze(1).expand(n, bw)
+    if par.ndim == 1:
+        par = par.view(n, -1)
+    toks = tokens.to(device=node_ids.device, dtype=torch.int64).view(n, -1)
+    # Trie-budget shrinks the survivor count, so ``parents`` may be narrower
+    # than ``node_ids``: index the batch dim against par's own width, not bw.
+    k = int(par.shape[1])
+    batch_idx = torch.arange(n, device=node_ids.device).unsqueeze(1).expand(n, k)
     old = node_ids[batch_idx, par]
     rel = toks - int(token_base)
     in_range = (rel >= 0) & (rel < vsz)
@@ -497,6 +505,41 @@ def _genrec_cuda(
         nxt = ws.get("dummy_next", (1, 1), torch.int64, device)
         node_out = ws.get("dummy_node_out", tuple(node_in.shape), torch.int64, device)
     try:
+        # Past GENREC_SERIAL_MERGE_MAX_K the fused kernel's per-survivor merge
+        # round dominates; the split path selects the same survivors with a
+        # radix top-k. It needs the real mask/expand buffers, so keep the fused
+        # kernel for the mask-less and expand-less variants.
+        if k > GENREC_SERIAL_MERGE_MAX_K and apply_mask_i and apply_expand_i:
+            if not call_genrec_split(
+                out_vals,
+                out_parents,
+                out_tokens,
+                out_indices,
+                scratch,
+                _maybe_contiguous(cum),
+                _maybe_contiguous(top_logprobs),
+                _maybe_contiguous(top_tokens),
+                node_in,
+                allow_u8,
+                tok_in,
+                tok_out,
+                nxt,
+                node_out,
+                do_exp,
+                int(token_base),
+                int(invalid_node),
+                col_t,
+                apply_advance_i,
+            ):
+                return None
+            return GenrecFusedResult(
+                vals=out_vals,
+                parents=out_parents,
+                tokens=out_tokens,
+                indices=out_indices,
+                token_ids=tok_out,
+                node_ids=node_out if apply_advance_i else None,
+            )
         mod.genrec_mask_topk_expand(
             out_vals,
             out_parents,
@@ -679,6 +722,88 @@ def call_genrec_cuda(
         int(invalid_node),
         int(apply_mask),
         int(apply_expand),
+        int(apply_advance),
+    )
+    return True
+
+
+# Above this select_k the fused kernel's K-round serial merge loses to a radix
+# select over the same plane. Measured in-graph on RTX 5090 at BW=1000, C=16:
+#   K:       1     4     8    16    32    64   128   256   1000
+#   fused: 14.4  22.5  30.8  49.2  85.8 159.4 304.8 593  2263 us
+#   split: 41.0  45.1  47.2  43.0  45.1  43.0  49.2  62    64 us
+# The split path is flat in K (torch.topk is a radix select) but pays three
+# kernel launches; the fused path is ~14us + 2.3us*K. They cross near K=12.
+# Raise the env var above the widest select_k to force the fused path, which is
+# how the A/B baseline is measured against a single server binary.
+GENREC_SERIAL_MERGE_MAX_K = int(
+    os.environ.get("FLASHREC_SERIAL_MERGE_MAX_K", "8")
+)
+
+
+def call_genrec_split(
+    out_vals: torch.Tensor,
+    out_parents: torch.Tensor,
+    out_tokens: torch.Tensor,
+    out_indices: torch.Tensor,
+    scratch: torch.Tensor,
+    cum: torch.Tensor,
+    top_logprobs: torch.Tensor,
+    top_tokens: torch.Tensor,
+    node_in: torch.Tensor,
+    allow_u8: torch.Tensor,
+    tok_in: torch.Tensor,
+    tok_out: torch.Tensor,
+    next_node: torch.Tensor,
+    node_out: torch.Tensor,
+    do_exp: torch.Tensor,
+    token_base: int,
+    invalid_node: int,
+    col_t: torch.Tensor,
+    apply_advance: int = 1,
+) -> bool:
+    """Same contract as ``call_genrec_cuda``, radix select instead of K-way merge.
+
+    ``genrec_mask_topk_expand`` picks survivors with one warp-merge round per
+    output, which is 97.5% of its runtime at RecIF's select_k=beam_width=1000.
+    Splitting score/mask and expand/advance into their own kernels lets
+    ``torch.topk`` do the selection, which is 35x faster at K=1000 and produces
+    bit-identical survivors (both take the max of the same masked plane).
+
+    Every buffer is caller-owned and ``col_t`` is read on the device, so this is
+    CUDA-graph safe. Returns False when the JIT module is unavailable.
+    """
+    mod = _try_module()
+    if mod is None or not hasattr(mod, "genrec_score_mask"):
+        return False
+    n, bw = int(cum.shape[0]), int(cum.shape[1])
+    c = int(top_logprobs.shape[2])
+    k = int(out_vals.shape[1])
+    m = bw * c
+    flat = scratch.view(n, m)
+    mod.genrec_score_mask(
+        flat, cum, top_logprobs, top_tokens, node_in, allow_u8, int(token_base), _NEG_INF
+    )
+    torch.topk(flat, k, dim=-1, largest=True, sorted=True, out=(out_vals, out_indices))
+    # parents = idx // C, tokens = plane token at idx. Both fold into the
+    # kernel's [N, K] selection inputs below.
+    torch.div(out_indices, c, rounding_mode="floor", out=out_parents)
+    torch.gather(top_tokens.view(n, m), 1, out_indices, out=out_tokens)
+    mod.genrec_expand_advance(
+        tok_out,
+        node_out,
+        out_parents,
+        out_tokens,
+        out_indices,
+        out_vals,
+        top_tokens,
+        tok_in,
+        node_in,
+        next_node,
+        do_exp,
+        col_t,
+        int(token_base),
+        int(invalid_node),
         int(apply_advance),
     )
     return True

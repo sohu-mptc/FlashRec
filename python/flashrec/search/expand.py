@@ -76,6 +76,9 @@ def init_from_prefill(
     valid_path: Optional[BeamValidPathTrie] = None,
     candidate_token_ids: Optional[torch.Tensor] = None,
     temperature: float = 0.0,
+    select_width: Optional[int] = None,
+    coverage_tau: float = 0.0,
+    coverage_n_min: Optional[int] = None,
 ) -> BeamSearchList:
     """Initialize a BeamSearchList from a single prefill logprob row ``[V]``.
 
@@ -83,14 +86,23 @@ def init_from_prefill(
     (exact — the row spans the whole candidate vocabulary), then samples the
     initial ``beam_width`` beams without replacement (Gumbel top-k) from the
     top ``beam_candidates`` pool instead of taking them deterministically.
+
+    ``select_width`` (default ``beam_width``) caps the first-level survivors.
+    With ``coverage_tau > 0`` and a trie ``leaf_count`` table, the survivors
+    are the smallest ranked prefix covering ``tau`` of the reachable leaf
+    mass, clamped to ``[coverage_n_min, select_width]``. The floor (not a cap:
+    a hard first-level cap of n0=64 truncated n=128/512 beams below their own
+    width and lost the correct first-level codes outright) defaults to 16.
     """
     if logprobs.dim() != 1:
         raise ValueError(f"expected 1D prefill logprobs, got {tuple(logprobs.shape)}")
     device = logprobs.device
+    sw = int(select_width) if select_width is not None else int(beam_width)
+    sw = max(min(sw, int(beam_width)), 1)
     logprobs = apply_temperature(logprobs, temperature)
     topk = min(int(beam_candidates), int(logprobs.shape[0]), int(logprobs.numel()))
-    if topk < beam_width:
-        raise ValueError(f"topk={topk} < beam_width={beam_width}")
+    if topk < sw:
+        raise ValueError(f"topk={topk} < select_width={sw}")
     vals, idx = logprobs.topk(topk, dim=0, sorted=True)
     tokens = _map_candidate_tokens(idx, candidate_token_ids)
     vals = vals.to(dtype=torch.float32)
@@ -103,28 +115,53 @@ def init_from_prefill(
         tokens = tokens[order]
     if temperature > 0.0:
         _, order = torch.topk(
-            vals + gumbel_like(vals), k=beam_width, largest=True, sorted=True
+            vals + gumbel_like(vals), k=sw, largest=True, sorted=True
         )
         sel_vals = vals.gather(0, order).contiguous()
         sel_tokens = tokens.gather(0, order).contiguous()
     else:
-        sel_vals = vals[:beam_width].contiguous()
-        sel_tokens = tokens[:beam_width].contiguous()
+        take = sw
+        if (
+            coverage_tau > 0.0
+            and valid_path is not None
+            and valid_path.active
+            and valid_path.mode == "trie"
+            and valid_path.ensure_unary_tables(device)
+            and valid_path._leaf_count is not None
+        ):
+            from flashrec.search.budget import coverage_select_count
+
+            nodes = valid_path.bootstrap_node_ids(
+                tokens.view(topk, 1), topk, 1, device
+            )
+            lc = valid_path._leaf_count.to(device=device)[
+                nodes.clamp(0, valid_path._leaf_count.shape[0] - 1)
+            ]
+            floor = int(coverage_n_min) if coverage_n_min is not None else 16
+            take = coverage_select_count(
+                lc[:topk],
+                tau=float(coverage_tau),
+                n_min=min(max(floor, 1), sw),
+                n_max=sw,
+            )
+        sel_vals = vals[:take].contiguous()
+        sel_tokens = tokens[:take].contiguous()
+        sw = take
 
     bl = BeamSearchList()
     bl.completed = []
-    bl.incomplete = bl.ensure_empty_stubs(beam_width)
+    bl.incomplete = bl.ensure_empty_stubs(sw)
     bl.prompt_len = int(prompt_len)
     bl.cum_logprobs = sel_vals
     bl.last_tokens = sel_tokens
     bl.init_token_ids(max_new_tokens, device=device)
-    if bl.token_ids is not None and bl.token_ids.shape[0] >= beam_width:
-        bl.token_ids[:beam_width, 0] = sel_tokens
+    if bl.token_ids is not None and bl.token_ids.shape[0] >= sw:
+        bl.token_ids[:sw, 0] = sel_tokens
         bl.cur_len = 1
         bl.dense_authoritative = True
     if valid_path is not None and valid_path.active and valid_path.mode == "trie":
         bl.node_ids = valid_path.bootstrap_node_ids(
-            sel_tokens.view(beam_width, 1), beam_width, 1, device
+            sel_tokens.view(sw, 1), sw, 1, device
         )
     return bl
 
@@ -138,13 +175,21 @@ def init_from_prefill_batch(
     valid_path: Optional[BeamValidPathTrie] = None,
     candidate_token_ids: Optional[torch.Tensor] = None,
     temperature: float = 0.0,
+    select_width: Optional[int] = None,
+    coverage_tau: float = 0.0,
+    coverage_n_min: Optional[int] = None,
 ) -> list[BeamSearchList]:
     """Batched ``init_from_prefill`` for a wave of B homogeneous prefills.
 
     ``logprobs`` is ``[B, V]``. One topk / mask / (gumbel) pass over the whole
     wave replaces B per-request passes; token buffers are one ``[B*bw, T]``
     allocation sliced into per-request views. Selection math is identical to
-    the single-request path (same ops on a batch dim).
+    the single-request path (same ops on a batch dim), including the
+    coverage-tau first-level prefix: it is computed for all B requests in one
+    batched cumsum and one host sync, and requests keep ragged views of the
+    rectangular buffers. Serving initializes through this path, so skipping
+    tau here (as before) silently disabled the first-level budget in
+    production.
     """
     if logprobs.dim() != 2:
         raise ValueError(f"expected 2D wave logprobs, got {tuple(logprobs.shape)}")
@@ -152,10 +197,12 @@ def init_from_prefill_batch(
     if B != len(prompt_lens):
         raise ValueError(f"logprobs rows {B} != prompt_lens {len(prompt_lens)}")
     device = logprobs.device
+    sw = int(select_width) if select_width is not None else int(beam_width)
+    sw = max(min(sw, int(beam_width)), 1)
     logprobs = apply_temperature(logprobs, temperature)
     topk = min(int(beam_candidates), int(logprobs.shape[1]))
-    if topk < beam_width:
-        raise ValueError(f"topk={topk} < beam_width={beam_width}")
+    if topk < sw:
+        raise ValueError(f"topk={topk} < select_width={sw}")
     vals, idx = logprobs.topk(topk, dim=1, sorted=True)
     tokens = _map_candidate_tokens(idx, candidate_token_ids)
     vals = vals.to(dtype=torch.float32)
@@ -166,37 +213,63 @@ def init_from_prefill_batch(
         tokens = tokens.gather(1, order)
     if temperature > 0.0:
         _, order = torch.topk(
-            vals + gumbel_like(vals), k=beam_width, dim=1, largest=True, sorted=True
+            vals + gumbel_like(vals), k=sw, dim=1, largest=True, sorted=True
         )
         sel_vals = vals.gather(1, order).contiguous()
         sel_tokens = tokens.gather(1, order).contiguous()
     else:
-        sel_vals = vals[:, :beam_width].contiguous()
-        sel_tokens = tokens[:, :beam_width].contiguous()
+        sel_vals = vals[:, :sw].contiguous()
+        sel_tokens = tokens[:, :sw].contiguous()
 
-    max_new_tokens = max(int(max_new_tokens), 1)
-    buf = torch.zeros(
-        (B * beam_width, max_new_tokens), dtype=torch.int64, device=device
-    )
-    buf[:, 0] = sel_tokens.reshape(-1)
     node_ids_all = None
     if valid_path is not None and valid_path.active and valid_path.mode == "trie":
         node_ids_all = valid_path.bootstrap_node_ids(
-            sel_tokens.reshape(B * beam_width, 1), B * beam_width, 1, device
+            sel_tokens.reshape(B * sw, 1), B * sw, 1, device
         )
+
+    takes = [sw] * B
+    if (
+        temperature <= 0.0
+        and coverage_tau > 0.0
+        and node_ids_all is not None
+        and valid_path.ensure_unary_tables(device)
+        and valid_path._leaf_count is not None
+    ):
+        lc_table = valid_path._leaf_count.to(device=device)
+        n_leaf = int(lc_table.shape[0])
+        nodes = node_ids_all.view(B, sw)
+        lc = lc_table[nodes.clamp(0, max(n_leaf - 1, 0))].to(dtype=torch.float32)
+        lc = torch.where((nodes >= 0) & (nodes < n_leaf), lc, torch.zeros_like(lc))
+        total = lc.sum(dim=1, keepdim=True)
+        csum = lc.cumsum(dim=1)
+        kvec = (csum < float(coverage_tau) * total).sum(dim=1).to(torch.int64) + 1
+        kvec = torch.where(total.squeeze(1) > 0, kvec, torch.full_like(kvec, sw))
+        floor = int(coverage_n_min) if coverage_n_min is not None else 16
+        kvec = kvec.clamp(min(max(floor, 1), sw), sw)
+        # Round up to a multiple of 32 so requests that shrank alike stay in
+        # one lock-step decode group (see expand_group_tbb).
+        kvec = torch.minimum((kvec + 31) // 32 * 32, torch.full_like(kvec, sw))
+        takes = [int(x) for x in kvec.cpu().tolist()]
+
+    max_new_tokens = max(int(max_new_tokens), 1)
+    buf = torch.zeros(
+        (B * sw, max_new_tokens), dtype=torch.int64, device=device
+    )
+    buf[:, 0] = sel_tokens.reshape(-1)
     out: list[BeamSearchList] = []
     for i in range(B):
+        k = takes[i]
         bl = BeamSearchList()
         bl.completed = []
-        bl.incomplete = bl.ensure_empty_stubs(beam_width)
+        bl.incomplete = bl.ensure_empty_stubs(k)
         bl.prompt_len = int(prompt_lens[i])
-        bl.cum_logprobs = sel_vals[i]
-        bl.last_tokens = sel_tokens[i]
-        bl.token_ids = buf[i * beam_width : (i + 1) * beam_width]
+        bl.cum_logprobs = sel_vals[i, :k]
+        bl.last_tokens = sel_tokens[i, :k]
+        bl.token_ids = buf[i * sw : i * sw + k]
         bl.cur_len = 1
         bl.dense_authoritative = True
         if node_ids_all is not None:
-            bl.node_ids = node_ids_all[i * beam_width : (i + 1) * beam_width]
+            bl.node_ids = node_ids_all[i * sw : i * sw + k]
         out.append(bl)
     return out
 
@@ -211,6 +284,7 @@ def expand_step(
     ignore_eos: bool = True,
     will_finish: bool = False,
     temperature: float = 0.0,
+    skip_mask: bool = False,
 ) -> Optional[torch.Tensor]:
     """One decode expand. Returns relative parent indices, or None if finished.
 
@@ -220,16 +294,34 @@ def expand_step(
     the survivors without replacement) while cumulative logprobs stay exact.
     Temperature *scaling* of ``top_logprobs`` is the caller's job — rows here
     are already truncated to top-k, so renormalizing over them would be wrong.
+
+    ``skip_mask=True`` assumes ``top_tokens`` were scored only over legal
+    neighbors (sparse path) so re-running ``mask_candidates`` would be a no-op
+    gather over the full codebook vocab.
     """
     if beam_list.cum_logprobs is None:
         raise RuntimeError("beam_list.cum_logprobs is not initialized")
     device = top_tokens.device
-    cum = beam_list.cum_logprobs.to(device=device, dtype=torch.float32)
+    cum = beam_list.cum_logprobs.to(device=device, dtype=torch.float32).reshape(-1)
     lp = top_logprobs.to(dtype=torch.float32)
     tt = top_tokens.to(dtype=torch.int64)
+    # Trie-budget / unary shrink live_width below the graph-padded beam, so
+    # logprob rows can outnumber survivors. Score only the live prefix.
+    n_live = min(int(cum.numel()), int(lp.shape[0]), int(tt.shape[0]))
+    if n_live <= 0:
+        return None
+    if int(cum.numel()) != n_live:
+        cum = cum[:n_live]
+    if int(lp.shape[0]) != n_live:
+        lp = lp[:n_live]
+        tt = tt[:n_live]
     scores = cum.unsqueeze(1) + lp
     cur_len = beam_list.generated_len()
-    if valid_path is not None and valid_path.active:
+    if (
+        not skip_mask
+        and valid_path is not None
+        and valid_path.active
+    ):
         scores = valid_path.mask_candidates(
             beam_list.token_ids,
             tt,

@@ -21,6 +21,7 @@ class RestrictedLMHead:
         self._level_weights: Optional[List[torch.Tensor]] = None
         self._level_token_ids: Optional[List[torch.Tensor]] = None
         self._codebook_sizes: Optional[List[int]] = None
+        self._token_base: Optional[int] = None
 
     @property
     def token_ids(self) -> Optional[torch.Tensor]:
@@ -31,6 +32,21 @@ class RestrictedLMHead:
         if self._token_ids is None:
             return None
         return int(self._token_ids.numel())
+
+    @property
+    def restricted_weight(self) -> Optional[torch.Tensor]:
+        """The ``[K, H]`` restricted head. Row ``i`` is token ``token_base + i``."""
+        return self._weight
+
+    @property
+    def token_base(self) -> Optional[int]:
+        """First restricted token id. Cached: ``_token_ids[0].item()`` is a sync
+        and ``compute_sparse`` / the fused scorer need it every decode step."""
+        if self._token_ids is None:
+            return None
+        if self._token_base is None:
+            self._token_base = int(self._token_ids[0].item())
+        return self._token_base
 
     @property
     def ready(self) -> bool:
@@ -97,6 +113,7 @@ class RestrictedLMHead:
                 raise ValueError(f"sid_token_range out of range for vocab {vocab}")
             self._token_ids = torch.tensor(ids, dtype=torch.long, device=device)
             self._weight = None
+            self._token_base = None
         if self._weight is None or self._weight.device != device:
             ids = self.ids or []
             lo, hi = int(ids[0]), int(ids[-1])
@@ -156,6 +173,29 @@ class RestrictedLMHead:
             raise RuntimeError("RestrictedLMHead.compute_into requires bind()")
         out.copy_(self._restricted_logprobs(hidden))
         return out
+
+    def compute_sparse(
+        self,
+        hidden: torch.Tensor,
+        token_ids: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Log-softmax over a padded neighbor set. ``token_ids`` / ``mask`` are ``[N, D]``.
+
+        Token ids are the original SID ids; rows of ``self._weight`` are the
+        restricted vocabulary starting at ``self._token_ids[0]``.
+        """
+        if self._weight is None or self._token_ids is None:
+            raise RuntimeError("RestrictedLMHead.compute_sparse requires bind()")
+        base = int(self._token_ids[0].item())
+        vsz = int(self._weight.shape[0])
+        rel = (token_ids.to(dtype=torch.int64) - base).clamp(0, max(vsz - 1, 0))
+        w = self._weight[rel]
+        h = hidden.to(dtype=w.dtype).unsqueeze(1)
+        logits = (h * w).sum(dim=-1)
+        neg = torch.finfo(torch.float32).min
+        logits = logits.float().masked_fill(~mask, neg)
+        return F.log_softmax(logits, dim=-1)
 
     def compute(
         self, hidden: torch.Tensor, lm_weight: torch.Tensor

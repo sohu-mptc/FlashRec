@@ -139,11 +139,11 @@ start_flashrec() {
   local beam="$1"
   local log="$OUTDIR/server_flashrec_n${beam}.log"
   kill_port "$FLASHREC_PORT"
-  local graph_bs slots aging max_bs_req
+  local graph_bs slots aging max_bs_req max_running
   case "$beam" in
-    50) graph_bs=800; slots=800; aging=300; max_bs_req=16 ;;
-    128) graph_bs=2048; slots=2048; aging=200; max_bs_req=16 ;;
-    *) graph_bs=4096; slots=4096; aging=150; max_bs_req=8 ;;
+    50)  graph_bs=800;  slots=800;  aging=300; max_bs_req=16; max_running=32 ;;
+    128) graph_bs=2048; slots=2048; aging=200; max_bs_req=16; max_running=32 ;;
+    *)   graph_bs=4096; slots=4096; aging=150; max_bs_req=8;  max_running=8 ;;
   esac
 
   echo "[flashrec] starting n=${beam} gpu=${FLASHREC_GPU} port=${FLASHREC_PORT}"
@@ -174,7 +174,7 @@ start_flashrec() {
     --batch-wait-max-ms 10 \
     --target-batch-requests 8 \
     --max-batch-requests "$max_bs_req" \
-    --max-running-requests 32 \
+    --max-running-requests "$max_running" \
     --schedule-policy lpm \
     --lpm-aging-ms "$aging" \
     --beam-width "$beam" \

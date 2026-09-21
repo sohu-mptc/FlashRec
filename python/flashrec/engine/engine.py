@@ -106,11 +106,21 @@ class ModelEngine:
                 device=self.device,
             )
 
+        bw = max(int(config.beam_width), 1)
+        slots = int(config.resolved_batch_slots())
+        max_running = max(int(config.max_running_requests), 1)
+        max_bs_req = max(int(config.max_batch_requests), 1)
+        # Prefill waves allocate n*bw beam rows in one shot, and HTTP can
+        # queue a full conc-group even when max_running is 1 (n=512). Size
+        # from the slot budget and max_batch_requests, not only max_running.
+        max_reqs = max(
+            max_running * bw * 2 + 256,
+            slots + max_bs_req + 256,
+            max_bs_req * bw * 2 + 256,
+            1024,
+        )
         self.req_pool = ReqToTokenPool(
-            max_reqs=max(
-                int(config.max_running_requests) * max(int(config.beam_width), 1) + 8,
-                1024,
-            ),
+            max_reqs=max_reqs,
             max_seq_len=int(config.max_seq_len),
             device=self.device,
         )
@@ -205,9 +215,15 @@ class ModelEngine:
     def alloc_tokens(self, n: int) -> torch.Tensor:
         loc = self.kv_pool.alloc(n)
         if loc is None and self.prefix_cache is not None:
-            need = max(int(n), min(4096, int(self.prefix_cache.num_cached_tokens)))
-            self.prefix_cache.evict(need)
-            loc = self.kv_pool.alloc(n)
+            # One evict(min(n, 4096)) is not enough once radix holds unique
+            # RecIF prefixes; keep reclaiming until the alloc fits or the
+            # cache has nothing unlocked left.
+            while loc is None and int(self.prefix_cache.num_cached_tokens) > 0:
+                need = max(int(n), 4096)
+                freed = self.prefix_cache.evict(need)
+                if int(freed) <= 0:
+                    break
+                loc = self.kv_pool.alloc(n)
         if loc is None:
             raise RuntimeError(f"out of KV tokens (need {n})")
         return loc

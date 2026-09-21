@@ -81,6 +81,11 @@ class TorchProfiler:
         self._cmd: Optional[ProfileCommand] = None
         self._profiled_ct = 0
         self.output_dir: Path = _default_output_dir()
+        # export_chrome_trace() serializes the whole trace (7s+ for a decode
+        # trace at beam=1000) and runs on the GPU worker thread, so it stalls
+        # every in-flight request. Hand the finished profiler to a writer
+        # thread instead; _export_threads lets callers join before exit.
+        self._export_threads: List[threading.Thread] = []
 
     def has_work(self) -> bool:
         return self._wake.is_set()
@@ -265,8 +270,7 @@ class TorchProfiler:
             self._profiler.stop()
             self.output_dir.mkdir(parents=True, exist_ok=True)
             path = self._trace_path(suffix)
-            self._profiler.export_chrome_trace(str(path))
-            logger.info("Profiling done. Trace saved to %s", path)
+            self._export_async(self._profiler, path)
         self._profiler = None
         self._in_progress = False
         self._current_stage = None
@@ -280,6 +284,36 @@ class TorchProfiler:
             self._configured = False
             self._cmd = None
             self._start_forward_ct = None
+
+    def _export_async(self, prof, path: Path) -> None:
+        """Serialize a stopped profiler to ``path`` off the worker thread.
+
+        ``prof`` is already stopped and is not touched again here, so the
+        worker can start the next stage (or resume decoding) immediately.
+        """
+
+        def _run() -> None:
+            try:
+                prof.export_chrome_trace(str(path))
+                logger.info("Profiling done. Trace saved to %s", path)
+            except Exception as exc:  # pragma: no cover - export is best effort
+                logger.warning("Trace export failed for %s: %s", path, exc)
+
+        thread = threading.Thread(
+            target=_run, name=f"flashrec-trace-export-{path.stem}", daemon=True
+        )
+        thread.start()
+        # Drop finished writers so a long-lived server does not accumulate them.
+        self._export_threads = [t for t in self._export_threads if t.is_alive()]
+        self._export_threads.append(thread)
+
+    def wait_for_exports(self, timeout: float = 300.0) -> bool:
+        """Join pending trace writers. Returns False if any is still running."""
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        for thread in list(self._export_threads):
+            thread.join(timeout=max(deadline - time.monotonic(), 0.0))
+        self._export_threads = [t for t in self._export_threads if t.is_alive()]
+        return not self._export_threads
 
     def _trace_path(self, stage_suffix: Optional[str]) -> Path:
         cmd = self._cmd

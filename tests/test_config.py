@@ -77,3 +77,7 @@ class TestBeamRecConfigSid:
         assert cfg.parsed_sid_token_ids() is None
         assert cfg.parsed_codebook_sizes() is None
         assert cfg.parsed_boundary_token_ids() is None
+
+    def test_unary_finish_defaults_on(self):
+        cfg = BeamRecConfig(model_path="/tmp/model")
+        assert cfg.enable_unary_finish is True

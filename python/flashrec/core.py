@@ -77,6 +77,13 @@ class BeamRequest:
     def beam_candidates(self) -> int:
         return max(int(self.beam_width) * 2, int(self.beam_width))
 
+    @property
+    def live_width(self) -> int:
+        bl = self.beam_list
+        if bl is not None and bl.last_tokens is not None:
+            return max(int(bl.last_tokens.shape[0]), 1)
+        return max(int(self.beam_width), 1)
+
 
 @dataclass
 class CascadeMeta:

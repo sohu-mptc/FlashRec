@@ -114,3 +114,9 @@ class TestTrieCsrParity:
             assert torch.equal(
                 out_d, out_c
             ), f"bootstrap mismatch at len {cur_len}:\n{out_d}\n{out_c}"
+
+    def test_unary_tables_match_dense(self, trie_pair):
+        _rng, _device, _seqs, dense, csr = trie_pair
+        assert torch.equal(dense._outdeg.cpu(), csr._outdeg.cpu())
+        assert torch.equal(dense._unary_token.cpu(), csr._unary_token.cpu())
+        assert torch.equal(dense._unary_child.cpu(), csr._unary_child.cpu())

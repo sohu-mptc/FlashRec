@@ -46,6 +46,24 @@ width, so a wide beam is a single graph replay.
 decoding to a catalog of valid semantic IDs. `lm_head` is evaluated only over
 the SID token range. Illegal SIDs are never candidates, so `invalid_rate` is
 0; open-vocabulary baselines leave ~17–27% of beams illegal.
+- **Trie-Budget Beam (TBB).** Wide beams shrink as decoding deepens: at every
+level the survivors are the smallest model-ranked prefix covering
+`trie_budget_tau` of the reachable `leaf_count` mass (topics reachable from
+each surviving node), clamped between `trie_budget-n0`/`trie-budget-n-min`
+and the beam width, until the remaining path is forced. The last remaining
+step skips the transformer when it is forced-unary, and the request is closed
+with the same `length` `FinishReason` as the regular path. Selection and
+expansion run once per lock-step group (one fused scoring launch plus one
+batched top-k), not per request. Tunables: `--trie-budget-n0` (floor, not a
+cap), `--trie-budget-tau`, `--trie-budget-n-max`, `--trie-budget-n-min`,
+`--trie-flush-leaves` (opt-in suffix enumeration; catalog order, off by
+default), `--disable-trie-budget`, `--disable-unary-finish`.
+- **Sparse lm_head.** When the average out-degree of the active frontier is
+small (CSR catalogs, or dense tries with `--sparse-max-outdeg`) the fused
+top-k expands directly from a padded neighbor gather `[N, D]`, log-softmax
+over the legal neighbors only, and never materializes the dense
+`[N, codebook_k]` row. Tunables: `--disable-sparse-lm-head`,
+`--sparse-max-outdeg`.
 - **Scheduling.** Requests are admitted into decode waves between steps under a
 beam-row slot budget, so beam rows from different requests share a step. A
 radix prefix KV cache with longest-prefix-match scheduling reduces the cost of

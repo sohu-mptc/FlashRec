@@ -143,6 +143,32 @@ class BeamRecConfig:
     enable_restricted_lm_head: bool = True
     enable_fused_expand: bool = True
     enable_graph_expand: bool = True
+    # Skip the last GPU decode when every remaining trie path has out-degree 1
+    # (RecIF 4-level ``sid_end``). Forced tokens add 0 to cum_logprobs.
+    enable_unary_finish: bool = True
+    # Sparse lm_head over trie neighbors (mainly CSR catalogs). Renormalizes
+    # over legal continuations; cross-beam ranking differs slightly from full
+    # codebook softmax-then-mask.
+    enable_sparse_lm_head: bool = True
+    sparse_max_outdeg: int = 256
+    # Fused CUDA scorer for the sparse path: reads lm_head rows in place rather
+    # than materializing [rows, outdeg, H], and pads to the trie's static max
+    # outdeg so no host sync is needed to size the plane. Falls back to the
+    # gather + matmul path when the JIT module is unavailable.
+    enable_fused_sparse_score: bool = True
+    # Progressive beam / coverage / leaf flush (Trie-Budget Beam).
+    enable_trie_budget: bool = True
+    # Floor (NOT a cap) of the per-level coverage prefix. The prefix itself is
+    # decided by trie_budget_tau over the model-ranked candidates, clamped to
+    # [max(n0, n_min), beam_width]. The old cap semantics truncated n=128/512
+    # first levels to 64 unranked survivors and collapsed recall.
+    trie_budget_n0: int = 64
+    trie_budget_tau: float = 0.9
+    trie_budget_n_max: int = 0  # 0 = beam_width
+    trie_budget_n_min: int = 16
+    # Leaf flush enumerates catalog suffixes in DFS order with tied parent
+    # scores — not a model ranking — so it is opt-in. 0 = off.
+    trie_flush_leaves: int = 0
     enable_prefill_batch: bool = True
     enable_warmup: bool = True
     enable_decode_pack: bool = True

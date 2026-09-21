@@ -56,6 +56,33 @@ class TestBeamValidPath:
         assert int(nxt[1].item()) == trie._prefix_to_node[(11, 20)]
         assert int(nxt[2].item()) == trie._prefix_to_node[(10, 21)]
 
+    def test_unary_tables_match_children(self):
+        trie = self._tiny_trie()
+        assert trie._outdeg is not None
+        root = trie._prefix_to_node[()]
+        n10 = trie._prefix_to_node[(10,)]
+        n11 = trie._prefix_to_node[(11,)]
+        n11_20 = trie._prefix_to_node[(11, 20)]
+        assert int(trie._outdeg[root].item()) == 2
+        assert int(trie._unary_token[root].item()) == -1
+        assert int(trie._outdeg[n10].item()) == 2
+        assert int(trie._unary_token[n10].item()) == -1
+        assert int(trie._outdeg[n11].item()) == 1
+        assert int(trie._unary_token[n11].item()) == 20
+        assert int(trie._unary_child[n11].item()) == n11_20
+        assert int(trie._outdeg[n11_20].item()) == 0
+        assert int(trie._unary_token[n11_20].item()) == -1
+
+    def test_unary_tables_survive_gpu_cache(self):
+        trie = self._tiny_trie()
+        n11 = trie._prefix_to_node[(11,)]
+        tok = int(trie._unary_token[n11].item())
+        child = int(trie._unary_child[n11].item())
+        trie._ensure_gpu_cache(torch.device("cpu"))
+        assert int(trie._outdeg[n11].item()) == 1
+        assert int(trie._unary_token[n11].item()) == tok
+        assert int(trie._unary_child[n11].item()) == child
+
     def test_codebook_and_flat_factory(self):
         ids = list(range(100, 112))
         codebook = build_beam_valid_path(

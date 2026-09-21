@@ -112,6 +112,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--disable-prefill-batch", action="store_true")
     p.add_argument("--disable-fused-expand", action="store_true")
     p.add_argument("--disable-graph-expand", action="store_true")
+    p.add_argument(
+        "--disable-unary-finish",
+        action="store_true",
+        help="Do not skip the last decode when the remaining SID path is unique.",
+    )
+    p.add_argument("--disable-sparse-lm-head", action="store_true")
+    p.add_argument("--sparse-max-outdeg", type=int, default=256)
+    p.add_argument("--disable-trie-budget", action="store_true")
+    p.add_argument("--trie-budget-n0", type=int, default=64)
+    p.add_argument("--trie-budget-tau", type=float, default=0.9)
+    p.add_argument("--trie-budget-n-max", type=int, default=0)
+    p.add_argument("--trie-budget-n-min", type=int, default=16)
+    p.add_argument(
+        "--trie-flush-leaves",
+        type=int,
+        default=0,
+        help="Enumerate catalog suffixes when subtrees are this small "
+        "(0 = off; catalog DFS order, not a model ranking).",
+    )
     p.add_argument("--disable-decode-pack", action="store_true")
     # Wide-beam decode: read the shared prompt KV once per request per step
     # (multi-level cascade attention). Only batches with at least
@@ -184,6 +203,15 @@ def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
         enable_prefill_batch=not args.disable_prefill_batch,
         enable_fused_expand=not args.disable_fused_expand,
         enable_graph_expand=not args.disable_graph_expand,
+        enable_unary_finish=not args.disable_unary_finish,
+        enable_sparse_lm_head=not args.disable_sparse_lm_head,
+        sparse_max_outdeg=args.sparse_max_outdeg,
+        enable_trie_budget=not args.disable_trie_budget,
+        trie_budget_n0=args.trie_budget_n0,
+        trie_budget_tau=args.trie_budget_tau,
+        trie_budget_n_max=args.trie_budget_n_max,
+        trie_budget_n_min=args.trie_budget_n_min,
+        trie_flush_leaves=args.trie_flush_leaves,
         enable_decode_pack=not args.disable_decode_pack,
         enable_cascade_attention=args.enable_cascade_attention,
         cascade_min_rows=args.cascade_min_rows,

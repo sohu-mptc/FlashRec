@@ -24,10 +24,13 @@
 
 namespace {
 
-// 512 threads/block so genrec_fused covers beam widths up to 512; static smem
-// (cum_s/nodes_s/sel_* below) stays ~14KiB, and the wide-beam score matrix
-// already spills to the global scratch via kMaxSmemScoresBytes.
-constexpr uint32_t kBeamTrieBlock = 512;
+// 1024 threads/block so genrec_fused covers beam widths up to 1000 (RecIF
+// wide-beam serving). Static smem (cum_s/nodes_s/sel_* below) is ~29KiB, so
+// the default 48KiB/block cap leaves under 20KiB for the score matrix. The
+// launcher opts into the device's larger per-block limit and only then lets
+// the score matrix live in smem (see genrec_max_dyn_smem); anything above the
+// resulting cap spills to global scratch.
+constexpr uint32_t kBeamTrieBlock = 1024;
 constexpr uint32_t kMaxSmemScoresBytes = 48u * 1024u;
 
 SGL_DEVICE int64_t clamp64(int64_t x, int64_t lo, int64_t hi) {
@@ -754,6 +757,352 @@ __global__ void genrec_mask_topk_expand_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Split select path: score+mask, then expand+advance around torch.topk.
+//
+// genrec_mask_topk_expand_kernel picks K survivors with a K-round warp-merge
+// over BW sorted lists. That is one block per request by construction and
+// costs ~2.2us per round, so at RecIF's select_k=beam_width=1000 the merge is
+// 97.5% of the kernel (measured: 0.057ms mask phase + 2.20us*K). A radix
+// select over the same BW*C plane does the whole job in 64us. These two
+// kernels are the parallel halves of the fused kernel with the serial merge
+// lifted out, so the caller can put torch.topk in between.
+// ---------------------------------------------------------------------------
+
+// scores[n, b*C + c] = cum[n,b] + top_logprobs[n,b,c], illegal children -> neg_inf.
+__global__ void genrec_score_mask_kernel(
+    float* __restrict__ scores,                // [N, BW*C]
+    const float* __restrict__ cum,             // [N, BW]
+    const float* __restrict__ top_logprobs,    // [N, BW, C]
+    const int64_t* __restrict__ top_tokens,    // [N, BW, C]
+    const int64_t* __restrict__ node_ids,      // [N, BW] or nullptr
+    const uint8_t* __restrict__ allow_table,   // [n_nodes, vsz] or nullptr
+    int64_t token_base,
+    int64_t n_nodes,
+    int64_t vsz,
+    float neg_inf,
+    uint32_t N,
+    uint32_t BW,
+    uint32_t C) {
+  const uint32_t M = BW * C;
+  const uint32_t total = N * M;
+  const bool do_mask = allow_table != nullptr && node_ids != nullptr;
+  for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += blockDim.x * gridDim.x) {
+    const uint32_t n = idx / M;
+    const uint32_t i = idx - n * M;
+    const uint32_t parent = i / C;
+    float s = cum[n * BW + parent] + top_logprobs[idx];
+    if (do_mask &&
+        !trie_cand_ok(node_ids[n * BW + parent], top_tokens[idx], allow_table, token_base, n_nodes, vsz)) {
+      s = neg_inf;
+    }
+    scores[idx] = s;
+  }
+}
+
+// Expand token planes and advance trie nodes for K already-selected survivors.
+// ``col_n`` is a device tensor so a CUDA graph can replay this at a new column
+// without a host round trip. Rows at or past K keep their previous contents,
+// matching the fused kernel when select_k < beam_width.
+//
+// Survivors whose score is -inf had no legal child. The fused kernel reports
+// those as parent 0 / index 0 and, because it reads the plane at that index,
+// token top_tokens[n, 0, 0]. Normalize the radix select's arbitrary argmax
+// residue to the same triple so both paths agree bit for bit.
+__global__ void genrec_expand_advance_kernel(
+    int64_t* __restrict__ token_ids_out,       // [N, BW, L]
+    int64_t* __restrict__ node_ids_out,        // [N, BW] or nullptr
+    int64_t* __restrict__ sel_parent,          // [N, K] in/out
+    int64_t* __restrict__ sel_token,           // [N, K] in/out
+    int64_t* __restrict__ sel_index,           // [N, K] in/out
+    const float* __restrict__ sel_val,         // [N, K]
+    const int64_t* __restrict__ top_tokens,    // [N, BW*C]
+    const int64_t* __restrict__ token_ids_in,  // [N, BW, L]
+    const int64_t* __restrict__ node_ids_in,   // [N, BW] or nullptr
+    const int64_t* __restrict__ next_node,     // [n_nodes, vsz] or nullptr
+    const uint8_t* __restrict__ do_expand,     // [N] or nullptr (=all)
+    const int32_t* __restrict__ col_n,         // [N] or nullptr
+    int64_t token_base,
+    int64_t n_nodes,
+    int64_t vsz,
+    int64_t invalid_node,
+    uint32_t N,
+    uint32_t BW,
+    uint32_t C,
+    uint32_t K,
+    uint32_t L,
+    int apply_advance) {
+  const uint32_t n = blockIdx.x;
+  if (n >= N) return;
+  const uint32_t col = (col_n != nullptr) ? static_cast<uint32_t>(col_n[n] < 0 ? 0 : col_n[n]) : 0u;
+
+  const int64_t* tin = token_ids_in + static_cast<size_t>(n) * BW * L;
+  int64_t* tout = token_ids_out + static_cast<size_t>(n) * BW * L;
+  int64_t* par = sel_parent + static_cast<size_t>(n) * K;
+  int64_t* tok = sel_token + static_cast<size_t>(n) * K;
+  int64_t* sidx = sel_index + static_cast<size_t>(n) * K;
+  const float* sval = sel_val + static_cast<size_t>(n) * K;
+  const int64_t dead_token = top_tokens[static_cast<size_t>(n) * BW * C];
+  const int64_t max_parent = static_cast<int64_t>(BW) - 1;
+  const uint32_t plane = BW * L;
+
+  for (uint32_t b = threadIdx.x; b < K; b += blockDim.x) {
+    if (!::isfinite(sval[b])) {
+      par[b] = 0;
+      sidx[b] = 0;
+      tok[b] = dead_token;
+    }
+  }
+  __syncthreads();
+
+  // The dead-slot normalization above is unconditional so the outputs match the
+  // fused kernel even for rows this block does not expand.
+  if (do_expand != nullptr && do_expand[n] == 0) return;
+
+  for (uint32_t idx = threadIdx.x; idx < plane; idx += blockDim.x) {
+    const uint32_t b = idx / L;
+    const uint32_t c = idx - b * L;
+    if (b >= K) {
+      tout[idx] = tin[idx];
+      continue;
+    }
+    if (col < L && c == col) {
+      tout[idx] = tok[b];
+    } else {
+      const int64_t p = clamp64(par[b], 0, max_parent);
+      tout[idx] = tin[static_cast<uint32_t>(p) * L + c];
+    }
+  }
+
+  if (!apply_advance || next_node == nullptr || node_ids_in == nullptr || node_ids_out == nullptr) {
+    return;
+  }
+  const int64_t* nin = node_ids_in + static_cast<size_t>(n) * BW;
+  int64_t* nout = node_ids_out + static_cast<size_t>(n) * BW;
+  for (uint32_t b = threadIdx.x; b < K; b += blockDim.x) {
+    const int64_t p = clamp64(par[b], 0, max_parent);
+    nout[b] = trie_transition(nin[p], tok[b], next_node, token_base, n_nodes, vsz, invalid_node);
+  }
+  for (uint32_t b = K + threadIdx.x; b < BW; b += blockDim.x) {
+    nout[b] = nin[b];
+  }
+}
+
+void genrec_score_mask(
+    tvm::ffi::TensorView scores,
+    tvm::ffi::TensorView cum,
+    tvm::ffi::TensorView top_logprobs,
+    tvm::ffi::TensorView top_tokens,
+    tvm::ffi::TensorView node_ids,
+    tvm::ffi::TensorView allow_table,
+    int64_t token_base,
+    double neg_inf) {
+  using namespace host;
+
+  SymbolicSize N = {"batch"};
+  SymbolicSize Bw = {"bw"};
+  SymbolicSize C = {"cand"};
+  SymbolicSize M = {"flat"};
+  SymbolicSize Nn = {"n_nodes"};
+  SymbolicSize V = {"vsz"};
+  SymbolicDevice device_;
+  device_.set_options<kDLCUDA>();
+
+  TensorMatcher({N, M})  //
+      .with_dtype<float>()
+      .with_device<kDLCUDA>(device_)
+      .verify(scores);
+  TensorMatcher({N, Bw})  //
+      .with_dtype<float>()
+      .with_device<kDLCUDA>(device_)
+      .verify(cum);
+  TensorMatcher({N, Bw, C})  //
+      .with_dtype<float>()
+      .with_device<kDLCUDA>(device_)
+      .verify(top_logprobs);
+  TensorMatcher({N, Bw, C})  //
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(top_tokens);
+  TensorMatcher({N, Bw})  //
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(node_ids);
+  TensorMatcher({Nn, V})  //
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(allow_table);
+
+  const uint32_t batch = static_cast<uint32_t>(N.unwrap());
+  const uint32_t bw = static_cast<uint32_t>(Bw.unwrap());
+  const uint32_t cand = static_cast<uint32_t>(C.unwrap());
+  RuntimeCheck(batch > 0 && bw > 0 && cand > 0, "genrec_score_mask: empty");
+  RuntimeCheck(
+      static_cast<uint32_t>(M.unwrap()) == bw * cand, "genrec_score_mask: scores must be [N, BW*C]");
+
+  const uint32_t total = batch * bw * cand;
+  const uint32_t grid = div_ceil(total, kBeamTrieBlock);
+  LaunchKernel(grid, kBeamTrieBlock, device_.unwrap())(
+      genrec_score_mask_kernel,
+      static_cast<float*>(scores.data_ptr()),
+      static_cast<const float*>(cum.data_ptr()),
+      static_cast<const float*>(top_logprobs.data_ptr()),
+      static_cast<const int64_t*>(top_tokens.data_ptr()),
+      static_cast<const int64_t*>(node_ids.data_ptr()),
+      static_cast<const uint8_t*>(allow_table.data_ptr()),
+      token_base,
+      Nn.unwrap(),
+      V.unwrap(),
+      static_cast<float>(neg_inf),
+      batch,
+      bw,
+      cand);
+}
+
+void genrec_expand_advance(
+    tvm::ffi::TensorView token_ids_out,
+    tvm::ffi::TensorView node_ids_out,
+    tvm::ffi::TensorView sel_parent,
+    tvm::ffi::TensorView sel_token,
+    tvm::ffi::TensorView sel_index,
+    tvm::ffi::TensorView sel_val,
+    tvm::ffi::TensorView top_tokens,
+    tvm::ffi::TensorView token_ids_in,
+    tvm::ffi::TensorView node_ids_in,
+    tvm::ffi::TensorView next_node,
+    tvm::ffi::TensorView do_expand,
+    tvm::ffi::TensorView col_n,
+    int64_t token_base,
+    int64_t invalid_node,
+    int64_t apply_advance) {
+  using namespace host;
+
+  SymbolicSize N = {"batch"};
+  SymbolicSize Bw = {"bw"};
+  SymbolicSize C = {"cand"};
+  SymbolicSize K = {"select_k"};
+  SymbolicSize L = {"width"};
+  SymbolicSize Nn = {"n_nodes"};
+  SymbolicSize V = {"vsz"};
+  SymbolicDevice device_;
+  device_.set_options<kDLCUDA>();
+
+  TensorMatcher({N, Bw, L})  //
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(token_ids_out)
+      .verify(token_ids_in);
+  TensorMatcher({N, Bw})  //
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(node_ids_out)
+      .verify(node_ids_in);
+  TensorMatcher({N, Bw, C})  //
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(top_tokens);
+  TensorMatcher({N, K})  //
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(sel_parent)
+      .verify(sel_token)
+      .verify(sel_index);
+  TensorMatcher({N, K})  //
+      .with_dtype<float>()
+      .with_device<kDLCUDA>(device_)
+      .verify(sel_val);
+  TensorMatcher({Nn, V})  //
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(next_node);
+  TensorMatcher({N})  //
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(do_expand);
+  TensorMatcher({N})  //
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(col_n);
+
+  const uint32_t batch = static_cast<uint32_t>(N.unwrap());
+  const uint32_t bw = static_cast<uint32_t>(Bw.unwrap());
+  const uint32_t cand = static_cast<uint32_t>(C.unwrap());
+  const uint32_t select_k = static_cast<uint32_t>(K.unwrap());
+  const uint32_t width = static_cast<uint32_t>(L.unwrap());
+  RuntimeCheck(
+      batch > 0 && bw > 0 && cand > 0 && select_k > 0 && width > 0, "genrec_expand_advance: empty");
+  RuntimeCheck(select_k <= bw, "genrec_expand_advance: select_k > bw");
+
+  LaunchKernel(batch, kBeamTrieBlock, device_.unwrap())(
+      genrec_expand_advance_kernel,
+      static_cast<int64_t*>(token_ids_out.data_ptr()),
+      static_cast<int64_t*>(node_ids_out.data_ptr()),
+      static_cast<int64_t*>(sel_parent.data_ptr()),
+      static_cast<int64_t*>(sel_token.data_ptr()),
+      static_cast<int64_t*>(sel_index.data_ptr()),
+      static_cast<const float*>(sel_val.data_ptr()),
+      static_cast<const int64_t*>(top_tokens.data_ptr()),
+      static_cast<const int64_t*>(token_ids_in.data_ptr()),
+      static_cast<const int64_t*>(node_ids_in.data_ptr()),
+      static_cast<const int64_t*>(next_node.data_ptr()),
+      static_cast<const uint8_t*>(do_expand.data_ptr()),
+      static_cast<const int32_t*>(col_n.data_ptr()),
+      token_base,
+      Nn.unwrap(),
+      V.unwrap(),
+      invalid_node,
+      batch,
+      bw,
+      cand,
+      select_k,
+      width,
+      static_cast<int>(apply_advance));
+}
+
+// Largest dynamic smem the fused kernel may request on this device, opting into
+// the >48KiB per-block carveout once. cudaFuncGetAttributes reports how much of
+// the block limit the static __shared__ arrays already took, so the remainder is
+// what the score matrix can use; 0 means "spill to global scratch".
+//
+// Cached per device: cudaFuncSetAttribute on every decode step would be a host
+// call on the critical path, and the value never changes for a live context.
+size_t genrec_max_dyn_smem(int device_id) {
+  static constexpr int kMaxDevices = 16;
+  static size_t cached[kMaxDevices] = {};
+  static bool ready[kMaxDevices] = {};
+  const bool cacheable = device_id >= 0 && device_id < kMaxDevices;
+  if (cacheable && ready[device_id]) return cached[device_id];
+
+  size_t budget = 0;
+  int opt_in = 0;
+  cudaFuncAttributes attr{};
+  if (::cudaFuncGetAttributes(&attr, genrec_mask_topk_expand_kernel) == cudaSuccess &&
+      ::cudaDeviceGetAttribute(&opt_in, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id) == cudaSuccess) {
+    // sharedSizeBytes is the static footprint; the opt-in limit covers static +
+    // dynamic, and drivers reject a request that lands exactly on the boundary
+    // on some architectures, so keep one 128B alignment unit in reserve.
+    const size_t stat = static_cast<size_t>(attr.sharedSizeBytes);
+    const size_t total = static_cast<size_t>(opt_in);
+    if (total > stat + 128u) {
+      budget = total - stat - 128u;
+      if (::cudaFuncSetAttribute(
+              genrec_mask_topk_expand_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+              static_cast<int>(budget)) != cudaSuccess) {
+        budget = 0;
+        ::cudaGetLastError();  // Swallow: caller falls back to global scratch.
+      }
+    }
+  } else {
+    ::cudaGetLastError();
+  }
+  if (cacheable) {
+    cached[device_id] = budget;
+    ready[device_id] = true;
+  }
+  return budget;
+}
+
 void genrec_mask_topk_expand(
     tvm::ffi::TensorView out_vals,
     tvm::ffi::TensorView out_parents,
@@ -898,7 +1247,10 @@ void genrec_mask_topk_expand(
   }
 
   const size_t score_bytes = static_cast<size_t>(bw) * cand * sizeof(float);
-  const int use_smem_scores = (apply_mask != 0 && score_bytes > 0 && score_bytes <= kMaxSmemScoresBytes) ? 1 : 0;
+  const size_t smem_cap = (score_bytes > 0 && score_bytes <= kMaxSmemScoresBytes)
+                              ? genrec_max_dyn_smem(device_.unwrap().device_id)
+                              : 0;
+  const int use_smem_scores = (apply_mask != 0 && score_bytes > 0 && score_bytes <= smem_cap) ? 1 : 0;
   const size_t dyn_smem = use_smem_scores ? ((score_bytes + 15u) & ~size_t{15}) : 0;
 
   LaunchKernel(batch, kBeamTrieBlock, device_.unwrap(), dyn_smem)(

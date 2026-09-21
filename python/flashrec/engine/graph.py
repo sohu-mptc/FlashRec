@@ -27,7 +27,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from flashrec.core import ForwardBatch
-from flashrec.kernel.beam_trie import GenrecFusedResult, call_genrec_cuda
+from flashrec.kernel.beam_trie import (
+    GENREC_SERIAL_MERGE_MAX_K,
+    GenrecFusedResult,
+    call_genrec_cuda,
+    call_genrec_split,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +463,16 @@ class DecodeGraphRunner:
         else:
             tok_in, tok_out = buf["exp_tok_in"], buf["exp_tok_out"]
             node_in, node_out = buf["exp_nodes"], buf["exp_node_out"]
-        ok = call_genrec_cuda(
+        # The fused kernel selects with one serial merge round per survivor, so
+        # it only wins at very narrow select_k; past that a radix select over
+        # the same masked plane is far cheaper (35x at select_k=1000). Both
+        # produce identical survivors.
+        launch = (
+            call_genrec_cuda
+            if int(spec.select_k) <= GENREC_SERIAL_MERGE_MAX_K
+            else call_genrec_split
+        )
+        ok = launch(
             buf["exp_vals"],
             buf["exp_parents"],
             buf["exp_tokens"],
@@ -479,7 +493,9 @@ class DecodeGraphRunner:
             buf["exp_col"],
         )
         if not ok:
-            raise RuntimeError("call_genrec_cuda failed during graph capture/replay")
+            raise RuntimeError(
+                f"{launch.__name__} failed during graph capture/replay"
+            )
 
     def _capture_one(
         self,
@@ -507,6 +523,8 @@ class DecodeGraphRunner:
             "out_loc": torch.zeros(bs, dtype=torch.int64, device=device),
             "kv_indices": kv_indices,
             "hidden": None,
+            # Filled only by _capture_cascade_graphs; see replay().
+            "hidden_cascade": None,
             "logprobs": None,
         }
         if logits_fn is not None and logprobs_k:
@@ -710,7 +728,12 @@ class DecodeGraphRunner:
             with torch.cuda.graph(g, **kwargs):
                 hidden = _run_lmhead()
             torch.cuda.synchronize()
-            buf["hidden"] = hidden
+            # Keep this separate from buf["hidden"]: the cascade graph writes a
+            # different output tensor, and the base (non-cascade) replay returns
+            # buf["hidden"]. Overwriting it here made every non-cascade replay
+            # read a tensor that only the cascade graph ever fills, so enabling
+            # --enable-cascade-attention silently returned unrelated beams.
+            buf["hidden_cascade"] = hidden
             self.graphs_cascade[bs] = g
             tag = " +cascade"
             if buf["logprobs"] is not None:
@@ -941,4 +964,6 @@ class DecodeGraphRunner:
             if fused is not None:
                 return logprobs[:raw_bs], fused
             return logprobs[:raw_bs].clone(), None
-        return buf["hidden"][:raw_bs], fused
+        # Each graph fills its own output tensor; return the one just replayed.
+        hidden = buf["hidden_cascade"] if cascade else buf["hidden"]
+        return hidden[:raw_bs], fused

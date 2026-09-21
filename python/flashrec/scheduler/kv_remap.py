@@ -38,6 +38,11 @@ def remap_by_parents(
 ) -> str:
     """Inplace gather of ``table[rows, prefix:seq]`` by parent. Returns kind.
 
+    ``parents_rel`` indexes the pre-expand frontier (a prefix of ``beam_rows``).
+    Its length is the post-expand live width and may be smaller than
+    ``beam_rows`` when trie-budget shrinks the beam while the pool still holds
+    the original ``beam_width`` slots. Destination is ``rows[:k]``.
+
     GPU ``classify_parents`` uses ``torch.equal`` / ``int(tensor.min())`` and
     host-syncs every decode step. Default is to always gather (an identity
     gather is cheaper than a sync).
@@ -49,18 +54,26 @@ def remap_by_parents(
     prefix_len = max(int(prefix_len), 0)
     if prefix_len >= seq_len:
         return "identity"
-    rows = beam_rows.to(dtype=torch.int64)
-    k = int(rows.numel())
+    rows = beam_rows.to(dtype=torch.int64).view(-1)
+    n_src = int(rows.numel())
     parents = parents_rel.to(dtype=torch.int64, device=rows.device).view(-1)
-    if int(parents.numel()) != k:
+    k = int(parents.numel())
+    if k <= 0:
         return "identity"
-    parents = parents.clamp(0, k - 1)
-    if not skip_classify and parents.device.type == "cpu":
+    if k > n_src:
+        # Growing past the allocated pool is the caller's job (alloc more rows).
+        return "identity"
+    parents = parents.clamp(0, n_src - 1)
+    if (
+        not skip_classify
+        and parents.device.type == "cpu"
+        and k == n_src
+    ):
         kind = classify_parents(parents, k)
         if kind == "identity":
             return kind
     else:
         kind = "gather"
     window = table[rows, prefix_len:seq_len]
-    table[rows, prefix_len:seq_len] = window[parents]
+    table[rows[:k], prefix_len:seq_len] = window[parents]
     return kind

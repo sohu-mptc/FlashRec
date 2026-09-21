@@ -189,6 +189,13 @@ class BeamRecServer:
         # Set once the worker finished CUDA-graph capture (or gave up); lets
         # serve() defer gc.freeze() past capture-time allocations.
         self._graph_ready = threading.Event()
+        self._idle_gc_stop = threading.Event()
+        self._idle_gc_thread: Optional[threading.Thread] = None
+        # Idle-GC handshake: the collector sets ``_gc_pause``; the worker
+        # clears ``_in_burst`` only between bursts and waits while paused, so
+        # STW cannot land mid-decode.
+        self._gc_pause = False
+        self._in_burst = False
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
         self.app = FastAPI(title="FlashRec")
@@ -202,6 +209,9 @@ class BeamRecServer:
         )
         self.app.add_api_route(
             "/stop_profile", self.stop_profile, methods=["GET", "POST"]
+        )
+        self.app.add_api_route(
+            "/wait_profile", self.wait_profile, methods=["GET", "POST"]
         )
 
     async def health(self):
@@ -254,6 +264,27 @@ class BeamRecServer:
         return PlainTextResponse(
             "Stop profiling. This will take some time.\n", status_code=200
         )
+
+    async def wait_profile(self, request: Request):
+        """Block until pending trace writers finish.
+
+        Trace export runs off the worker thread so it cannot stall decode, so
+        ``/stop_profile`` returns before the file exists. Harnesses that read
+        the trace right after benchmarking poll this instead of sleeping.
+        """
+        timeout = 300.0
+        try:
+            body = await request.json()
+            if isinstance(body, dict) and body.get("timeout") is not None:
+                timeout = float(body["timeout"])
+        except Exception:
+            pass
+        done = await asyncio.to_thread(self.profiler.wait_for_exports, timeout)
+        if not done:
+            return PlainTextResponse(
+                "Trace export still running.\n", status_code=503
+            )
+        return PlainTextResponse("Trace export done.\n", status_code=200)
 
     async def chat_completions(self, request: ChatCompletionRequest):
         messages = [
@@ -425,6 +456,141 @@ class BeamRecServer:
                 if job.request is not None:
                     job_by_rid.pop(job.request.rid, None)
 
+    def _has_inflight_work(self) -> bool:
+        """True when decode/prefill is active (queue-only wait is not inflight)."""
+        return bool(self.engine.has_work() or self.profiler.has_work())
+
+    def start_idle_gc(
+        self,
+        *,
+        poll_s: float = 0.5,
+        idle_s: float = 1.0,
+        min_interval_s: float = 30.0,
+        max_defer_s: float = 300.0,
+        freeze_every: int = 5,
+    ) -> None:
+        """Reclaim cyclic garbage only when it will not STW an in-flight decode.
+
+        Automatic GC is disabled after startup. This daemon thread runs
+        ``gc.collect`` when the server has been fully idle, or — if that never
+        happens under sustained load — between bursts once ``max_defer_s`` has
+        elapsed (no active decode; queued jobs may wait out the pause).
+        """
+        if self._idle_gc_thread is not None:
+            return
+        self._idle_gc_stop.clear()
+        self._idle_gc_thread = threading.Thread(
+            target=self._idle_gc_loop,
+            name="flashrec-idle-gc",
+            kwargs={
+                "poll_s": float(poll_s),
+                "idle_s": float(idle_s),
+                "min_interval_s": float(min_interval_s),
+                "max_defer_s": float(max_defer_s),
+                "freeze_every": max(int(freeze_every), 1),
+            },
+            daemon=True,
+        )
+        self._idle_gc_thread.start()
+
+    def stop_idle_gc(self) -> None:
+        self._idle_gc_stop.set()
+        thread = self._idle_gc_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._idle_gc_thread = None
+
+    def _idle_gc_loop(
+        self,
+        *,
+        poll_s: float,
+        idle_s: float,
+        min_interval_s: float,
+        max_defer_s: float,
+        freeze_every: int,
+    ) -> None:
+        import gc
+
+        last_busy = time.monotonic()
+        # Start the defer clock now so we do not collect on the first quiet
+        # between-burst gap right after the port opens.
+        last_gc = time.monotonic()
+        collect_n = 0
+        while not self._idle_gc_stop.wait(timeout=max(poll_s, 0.05)):
+            now = time.monotonic()
+            with self._cv:
+                if self._stop:
+                    return
+                inflight = self._has_inflight_work() or self._in_burst
+                queued = bool(self._queue)
+                if inflight or queued:
+                    last_busy = now
+                reason = _idle_gc_should_run(
+                    inflight=inflight,
+                    queued=queued,
+                    idle_for=now - last_busy,
+                    since_gc=now - last_gc,
+                    idle_s=idle_s,
+                    min_interval_s=min_interval_s,
+                    max_defer_s=max_defer_s,
+                )
+                if reason is None:
+                    continue
+                # Ask the worker to stay out of run_burst, then wait until any
+                # current burst finishes. Holding ``_gc_pause`` across collect
+                # keeps new bursts from starting; enqueue still works.
+                self._gc_pause = True
+                wait_deadline = time.monotonic() + 2.0
+                while (
+                    self._in_burst
+                    and not self._stop
+                    and time.monotonic() < wait_deadline
+                ):
+                    self._cv.wait(timeout=0.05)
+                if self._stop:
+                    self._gc_pause = False
+                    return
+                if self._in_burst or self._has_inflight_work():
+                    self._gc_pause = False
+                    last_busy = time.monotonic()
+                    continue
+                if reason == "idle" and self._queue:
+                    self._gc_pause = False
+                    last_busy = time.monotonic()
+                    continue
+
+                t0 = time.perf_counter()
+                collected = (
+                    int(gc.collect(0)),
+                    int(gc.collect(1)),
+                    int(gc.collect(2)),
+                )
+                frozen = None
+                if collect_n % freeze_every == freeze_every - 1:
+                    gc.freeze()
+                    frozen = int(gc.get_freeze_count())
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                self._gc_pause = False
+                self._cv.notify_all()
+
+            last_gc = time.monotonic()
+            collect_n += 1
+            if frozen is None:
+                logger.info(
+                    "idle GC (%s): pause=%.1fms collected=%s",
+                    reason,
+                    dt_ms,
+                    collected,
+                )
+            else:
+                logger.info(
+                    "idle GC (%s): pause=%.1fms collected=%s frozen=%d",
+                    reason,
+                    dt_ms,
+                    collected,
+                    frozen,
+                )
+
     def _run_warmup_iters(self) -> None:
         """Run end-to-end warmup generations before the port opens.
 
@@ -587,20 +753,31 @@ class BeamRecServer:
                             jobs = jobs[:k]
                             self._queue[0:0] = leftover
             self.profiler.poll()
-            if jobs:
-                recent_batch = max(len(jobs), (recent_batch + len(jobs)) // 2, 1)
-                self._submit_jobs(jobs, job_by_rid)
-            if self.engine.has_work():
-                try:
-                    self.engine.run_burst(peek)
-                except Exception as exc:
-                    logger.exception("inflight step failed")
-                    stuck = list(job_by_rid.values())
-                    job_by_rid.clear()
-                    self.engine.inflight.waiting.clear()
-                    self.engine.inflight.running.clear()
-                    for job in stuck:
-                        self._set_future(job, exc=exc)
+            with self._cv:
+                while self._gc_pause and not self._stop:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                self._in_burst = True
+            try:
+                if jobs:
+                    recent_batch = max(len(jobs), (recent_batch + len(jobs)) // 2, 1)
+                    self._submit_jobs(jobs, job_by_rid)
+                if self.engine.has_work():
+                    try:
+                        self.engine.run_burst(peek)
+                    except Exception as exc:
+                        logger.exception("inflight step failed")
+                        stuck = list(job_by_rid.values())
+                        job_by_rid.clear()
+                        self.engine.inflight.waiting.clear()
+                        self.engine.inflight.running.clear()
+                        for job in stuck:
+                            self._set_future(job, exc=exc)
+            finally:
+                with self._cv:
+                    self._in_burst = False
+                    self._cv.notify_all()
             self.profiler.poll()
 
     @staticmethod
@@ -698,6 +875,31 @@ class BeamRecServer:
         ]
 
 
+def _idle_gc_should_run(
+    *,
+    inflight: bool,
+    queued: bool,
+    idle_for: float,
+    since_gc: float,
+    idle_s: float,
+    min_interval_s: float,
+    max_defer_s: float,
+) -> Optional[str]:
+    """Return ``idle`` / ``deferred`` when a collect is safe, else ``None``.
+
+    ``idle``: no queue and no decode for ``idle_s``.
+    ``deferred``: still no decode, but ``max_defer_s`` since the last collect
+    under sustained queue pressure (queued jobs may wait out the STW).
+    """
+    if since_gc < min_interval_s:
+        return None
+    if not inflight and not queued and idle_for >= idle_s:
+        return "idle"
+    if not inflight and since_gc >= max_defer_s:
+        return "deferred"
+    return None
+
+
 def _install_gc_probe() -> None:
     import gc
 
@@ -725,20 +927,29 @@ def _install_gc_probe() -> None:
 
 
 def _tune_gc_after_startup() -> None:
-    """Keep startup-resident objects out of every future GC scan.
+    """Freeze startup-resident objects and disable automatic GC.
 
-    The valid-SID map and tokenizer tables are millions of permanently live
-    objects. Without freeze() each gen-2 pass retraces all of them and stalls
-    every in-flight request for ~200ms while collecting nothing.
+    The valid-SID map and tokenizer tables are permanently live. Without
+    freeze() a gen-2 pass retraces them and stalls every in-flight request
+    for ~200ms while collecting nothing.
+
+    Automatic threshold-driven GC is also disabled: under traffic gen-0/gen-1
+    still run every few minutes / ~4h and STW the worker mid-request
+    (~50ms / ~300ms) even after freeze. Cyclic garbage is reclaimed only from
+    the idle-GC loop while no decode is in flight.
     """
     import gc
 
     gc.collect()
     gc.collect()
     gc.freeze()
+    gc.disable()
+    # Kept for the rare case something re-enables automatic GC later.
     gc.set_threshold(20_000, 50, 100)
     logger.info(
-        "GC tuned: frozen=%d threshold=%s", gc.get_freeze_count(), gc.get_threshold()
+        "GC tuned: frozen=%d disabled=True (idle-window collect) threshold=%s",
+        gc.get_freeze_count(),
+        gc.get_threshold(),
     )
 
 
@@ -752,10 +963,14 @@ def serve(config: BeamRecConfig) -> None:
     if not server._graph_ready.wait(timeout=1800.0):
         logger.warning("CUDA graph capture/warmup still running; tuning GC anyway")
     _tune_gc_after_startup()
-    uvicorn.run(
-        server.app,
-        host=config.host,
-        port=int(config.port),
-        log_level=config.log_level,
-        access_log=bool(getattr(config, "access_log", False)),
-    )
+    server.start_idle_gc()
+    try:
+        uvicorn.run(
+            server.app,
+            host=config.host,
+            port=int(config.port),
+            log_level=config.log_level,
+            access_log=bool(getattr(config, "access_log", False)),
+        )
+    finally:
+        server.stop_idle_gc()
