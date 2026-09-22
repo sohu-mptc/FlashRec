@@ -48,7 +48,7 @@ dependencies = [
     "safetensors>=0.4.3",
     "sgl-kernel>=0.3.21,<0.4",
     "torch>=2.9,<3",
-    "transformers>=4.51,<5",
+    "transformers>=4.51,<6",
     "triton>=3.5,<4",
     "uvicorn>=0.30",
 ]
