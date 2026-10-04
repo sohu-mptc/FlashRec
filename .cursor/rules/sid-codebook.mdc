@@ -1,0 +1,47 @@
+---
+description: OneRec / SoHu / MiniOneRec SID codebook sizes, token ids, and catalog paths
+alwaysApply: true
+---
+
+# SID codebook (OneRec + SoHu + MiniOneRec)
+
+Authoritative NAS copies: `/mnt/nas_new_1/flashrec_data/data/catalogs/{CODEBOOK.md,codebook.json}`.
+
+## Quick table
+
+| Model | Logical size | FlashRec `--sid` | begin / end | HF `--codebook-size` | Catalog |
+|-------|-------------:|------------------|-------------:|---------------------:|---------|
+| OneRec-1.7B | **8192³** | infer from tokenizer+catalog | 176245 / 176246 | **8192** | `sid2pid_beamrec_l4.json` or RecIF `sid2pid.json` / `sid2iid.json` |
+| SoHuRec-1.7B | **512³** | `151669:153204/512,512,512` | 153205 / 153206 | **512** | `sid2pid_sohurec_l3.json` |
+| SoHuRec-v2 | **512³** | same as SoHuRec-1.7B | 153205 / 153206 | **512** | same SoHu L3 |
+| SoHuRec-0.6B | **512³** | `151669:153204/512,512,512@176245,176246` | **176245 / 176246** (override required) | **512** | same SoHu L3 |
+| MiniOneRec-Industrial | **48×256×256** | `151665:152224/48,256,256@none` | **none** | densified | `sid2vid_minionerec_industrial.json` |
+
+OneRec / SoHu decode is **5** tokens: `sid_begin → a → b → c → sid_end` (`max_tokens=5`).
+MiniOneRec decode is **3** tokens: `a → b → c` (`max_tokens=3`, `@none` boundary).
+
+## Token ids (named)
+
+- OneRec / SoHu-0.6B named bases: `s_a_0=151669`, `s_b_0=159861`, `s_c_0=168053`
+- SoHu-1.7B / SoHuRec-v2 named bases (contiguous 512 window): `s_a_0=151669`, `s_b_0=152181`, `s_c_0=152693`
+- MiniOneRec bases: `a=151665..151712`, `b=151713..151968`, `c=151969..152224` (Qwen2.5-1.5B)
+
+## Data paths (NAS)
+
+- OneRec RecIF: `/mnt/nas_new_1/flashrec_data/data/OpenOneRec-RecIF/benchmark_data/`
+- SoHu prompts (no GT): `.../data/sohu/genrec_perf_prompts.jsonl`
+- SoHu **with GT**: `.../data/sohu_gt/sohu_samples_with_gt_5000.json` (codebook note: `.../data/sohu_gt.CODEBOOK.md`)
+- SoHu-v2 **with GT**: `.../data/sohu_v2_gt/sohu_v2_samples_with_gt_5000.json`；ckpt `.../models/SoHuRec-v2`
+- MiniOneRec Amazon: `.../data/MiniOneRec-Amazon/Amazon/`；ckpt `.../models/MiniOneRec/Industrial_ckpt`
+- **Cross-machine serve/benchmark runbook:** `/mnt/nas_new_1/flashrec_data/BENCHMARK.md`（`benchmark/env.sh` + wrappers）
+- SGLang-0801 fork (python): `.../src/sglang-beam-search-0801`
+
+## Agent pitfalls
+
+1. **Never** put SoHu `512` SID string on OneRec (or OneRec `8192` on SoHu).
+2. SoHu-0.6B **must** use `@176245,176246` or beams start on fake begin/end.
+3. `canonicalize_sohu_sid_tokens` only remaps **flat all-`<s_a_*>`** SoHu beams; do not remap mixed OneRec `<s_a/b/c_*>` when `a≥512`.
+4. FlashRec piece rewrite (`TokenizerAdapter`) runs only for codebook `512,512,512` when `<s_b_0>` is more than 512 ids after `<s_a_0>` (SoHu-0.6B packed window). Never rewrite OneRec 8192 layers: `<s_a_512+>` printed as `<s_b/c_*>` is a decoder bug, and the L4 catalog is already correct.
+5. Open-vocab HF on SoHu → invalid ≈ 1; use `--constraint catalog`.
+6. Prefer `scripts/serve_sohu.sh` / documented OneRec serve recipe over hand-copied token ids from another checkpoint.
+7. MiniOneRec catalog keys are **dense** indices (token-id order), not raw RQ labels inside `<a_N>` — rebuild with `scripts/build_minionerec_catalog.py`.

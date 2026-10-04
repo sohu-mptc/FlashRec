@@ -8,8 +8,28 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
+def _compressed_sohu_window(codebook_sizes: Optional[List[int]]) -> bool:
+    """SoHu-0.6B serves a 512×3 codebook packed into ``<s_a_0>..<s_a_1535>``.
+
+    OneRec uses the same tokenizer names with real 8192-wide ``<s_a/b/c_*>``
+    layers. Remapping that layout prints legal ``<s_a_512+>`` codes as
+    ``<s_b_*>`` / ``<s_c_*>`` and the catalog lookup misses them.
+    """
+    if not codebook_sizes or len(codebook_sizes) < 3:
+        return False
+    return (
+        int(codebook_sizes[0]) == 512
+        and int(codebook_sizes[1]) == 512
+        and int(codebook_sizes[2]) == 512
+    )
+
+
 class TokenizerAdapter:
-    def __init__(self, model_path: str):
+    def __init__(
+        self,
+        model_path: str,
+        codebook_sizes: Optional[List[int]] = None,
+    ):
         self.tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         # Added/special tokens decode as their literal piece, so a dict lookup
         # reproduces HF decode exactly. GenRec beams are all SID special
@@ -28,6 +48,13 @@ class TokenizerAdapter:
         # Vocab-indexed piece table: decode a whole (beams, len) id matrix with
         # one fancy-index instead of a per-token dict lookup. Ids without a
         # piece hold None so "".join raises TypeError -> caller falls back.
+        # SoHu-0.6B ships contiguous <s_a_0>..<s_a_8191> then separate
+        # <s_b_*> / <s_c_*> namespaces, but production GenRec serves the
+        # compressed 512×3 window at the start of <s_a_*> (catalog token_ids
+        # [base, base+512, base+1024]). Remap that window to s_a/s_b/s_c so
+        # decoded beams match GT / catalog naming.
+        if _compressed_sohu_window(codebook_sizes):
+            self._remap_sohu_compressed_codebook_pieces()
         self._piece_arr: Optional[np.ndarray] = None
         if self._piece:
             size = max(self._piece) + 1
@@ -35,6 +62,24 @@ class TokenizerAdapter:
             for idx, s in self._piece.items():
                 arr[idx] = s
             self._piece_arr = arr
+
+    def _remap_sohu_compressed_codebook_pieces(self) -> None:
+        piece = self._piece
+        if not piece:
+            return
+        a0 = next((i for i, s in piece.items() if s == "<s_a_0>"), None)
+        b0 = next((i for i, s in piece.items() if s == "<s_b_0>"), None)
+        if a0 is None or b0 is None or b0 <= a0 + 512:
+            return
+        # Compressed production window: three 512-wide levels packed into s_a_*.
+        width = 512
+        n_levels = 3
+        letters = "abc"
+        for level in range(n_levels):
+            for code in range(width):
+                tid = a0 + level * width + code
+                if tid in piece:
+                    piece[tid] = f"<s_{letters[level]}_{code}>"
 
     def decode_matrix(self, ids: np.ndarray) -> Optional[List[str]]:
         """Decode an int id matrix (n, L) of special/added tokens; None if any
@@ -56,6 +101,12 @@ class TokenizerAdapter:
         return [int(x) for x in self.tok.encode(text, add_special_tokens=False)]
 
     def decode(self, tokens: List[int]) -> str:
+        piece = self._piece
+        if piece:
+            try:
+                return "".join(piece[int(t)] for t in tokens)
+            except (KeyError, TypeError):
+                pass
         try:
             return self.tok.decode(tokens, skip_special_tokens=False)
         except Exception:

@@ -76,7 +76,10 @@ class BeamRecEngine:
         self.config = config
         self.runner = ModelEngine(config)
         self.device = self.runner.device
-        self.tokenizer = TokenizerAdapter(config.model_path)
+        self.tokenizer = TokenizerAdapter(
+            config.model_path,
+            codebook_sizes=config.parsed_codebook_sizes(),
+        )
         self.host_pool = HostPool(int(getattr(config, "host_worker_threads", 4) or 0))
         self.prefix_cache = self.runner.prefix_cache
         special = config.parsed_sid_token_ids()
