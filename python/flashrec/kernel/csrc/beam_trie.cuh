@@ -674,19 +674,30 @@ __global__ void genrec_mask_topk_expand_kernel(
       int best_b = 0;
       int best_i = 0;
       int best_p = 0;
+      int64_t best_tok = (M > 0) ? tok_n[0] : static_cast<int64_t>(0);
+      const size_t ok = static_cast<size_t>(n) * K + k;
       if (best.valid) {
         out_v = best.v;
         best_b = best.b;
         best_i = best.idx;
         best_p = best.p;
+        best_tok = (M > 0) ? tok_n[best_i] : static_cast<int64_t>(0);
+      } else if (k > 0) {
+        // No legal child left. tok_n[0] is parent 0's unconstrained top token,
+        // which this mask just rejected; writing it fills the beam with one
+        // repeated illegal SID (measured ~17% invalid at SoHu beam=50).
+        // Repeat survivor 0, the best legal child, and keep the score -inf.
+        const size_t src = static_cast<size_t>(n) * K;
+        best_b = static_cast<int>(out_parents[src]);
+        best_i = static_cast<int>(out_indices[src]);
+        best_tok = out_tokens[src];
       }
-      const size_t ok = static_cast<size_t>(n) * K + k;
       out_vals[ok] = out_v;
       out_parents[ok] = static_cast<int64_t>(best_b);
-      out_tokens[ok] = (M > 0) ? tok_n[best_i] : static_cast<int64_t>(0);
+      out_tokens[ok] = best_tok;
       out_indices[ok] = static_cast<int64_t>(best_i);
       sel_parent[k] = static_cast<int64_t>(best_b);
-      sel_token[k] = (M > 0) ? tok_n[best_i] : static_cast<int64_t>(0);
+      sel_token[k] = best_tok;
       win_b = best.valid ? best_b : -1;
       win_p = best_p;
     }
@@ -806,10 +817,11 @@ __global__ void genrec_score_mask_kernel(
 // without a host round trip. Rows at or past K keep their previous contents,
 // matching the fused kernel when select_k < beam_width.
 //
-// Survivors whose score is -inf had no legal child. The fused kernel reports
-// those as parent 0 / index 0 and, because it reads the plane at that index,
-// token top_tokens[n, 0, 0]. Normalize the radix select's arbitrary argmax
-// residue to the same triple so both paths agree bit for bit.
+// Survivors whose score is -inf had no legal child. When survivor 0 is legal,
+// copy it (parent, token, index) so the beam stays inside the trie. Copying
+// top_tokens[n, 0, 0] instead emits parent 0's unconstrained top token, which
+// the mask rejected. Only an all-dead plane falls back to that sentinel, and
+// both paths must still agree on it.
 __global__ void genrec_expand_advance_kernel(
     int64_t* __restrict__ token_ids_out,       // [N, BW, L]
     int64_t* __restrict__ node_ids_out,        // [N, BW] or nullptr
@@ -846,12 +858,18 @@ __global__ void genrec_expand_advance_kernel(
   const int64_t dead_token = top_tokens[static_cast<size_t>(n) * BW * C];
   const int64_t max_parent = static_cast<int64_t>(BW) - 1;
   const uint32_t plane = BW * L;
+  // topk is sorted, so a finite survivor 0 means every later -inf slot is
+  // padding. Read the template before any thread rewrites the tail.
+  const bool slot0_live = (K > 0u) && ::isfinite(sval[0]);
+  const int64_t tpl_par = slot0_live ? par[0] : static_cast<int64_t>(0);
+  const int64_t tpl_tok = slot0_live ? tok[0] : dead_token;
+  const int64_t tpl_idx = slot0_live ? sidx[0] : static_cast<int64_t>(0);
 
   for (uint32_t b = threadIdx.x; b < K; b += blockDim.x) {
     if (!::isfinite(sval[b])) {
-      par[b] = 0;
-      sidx[b] = 0;
-      tok[b] = dead_token;
+      par[b] = tpl_par;
+      sidx[b] = tpl_idx;
+      tok[b] = tpl_tok;
     }
   }
   __syncthreads();

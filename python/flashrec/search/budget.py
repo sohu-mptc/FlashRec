@@ -132,6 +132,13 @@ def expand_group_tbb(
     idx_full = parents * d + (idx - parents * cols)
     tokens = scores.tokens.view(n, live * d).gather(1, idx_full)
     children = scores.children.view(n, live * d).gather(1, idx_full)
+    # -inf tail is a masked child (token 0). Repeating the best legal survivor
+    # keeps the beam inside the trie when legal fanout is below select_k.
+    from flashrec.search.expand import repeat_best_legal
+
+    parents, tokens, children = repeat_best_legal(
+        vals, (parents, tokens, children)
+    )
 
     if tau > 0.0 and leaf_count is not None and int(leaf_count.numel()) > 0:
         n_leaf = int(leaf_count.numel())

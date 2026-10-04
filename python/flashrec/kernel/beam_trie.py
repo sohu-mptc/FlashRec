@@ -53,7 +53,7 @@ def _try_module():
         if not cuh.is_file():
             logger.info("beam_trie JIT fallback (missing %s)", cuh.name)
             return None
-        src = f'#include "{cuh}"\n'
+        src = f'#include "{cuh}"\n// dead slots repeat the best legal survivor\n'
         wrappers = [
             "TVM_FFI_DLL_EXPORT_TYPED_FUNC(trie_mask_candidates, (trie_mask_candidates));",
             "TVM_FFI_DLL_EXPORT_TYPED_FUNC(trie_advance_nodes, (trie_advance_nodes));",
@@ -643,6 +643,9 @@ def genrec_mask_topk_expand(
     )
     parents = indices // c
     tokens = top_tokens.reshape(n, bw * c).gather(1, indices)
+    from flashrec.search.expand import repeat_best_legal
+
+    parents, tokens, indices = repeat_best_legal(vals, (parents, tokens, indices))
     tok_out = token_ids
     node_out = node_ids
     col_t = None

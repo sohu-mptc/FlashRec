@@ -17,6 +17,7 @@ __all__ = [
     "init_from_prefill",
     "init_from_prefill_batch",
     "expand_step",
+    "repeat_best_legal",
     "apply_temperature",
     "gumbel_like",
 ]
@@ -57,6 +58,25 @@ def _stop_tokens_tensor(
         t = torch.as_tensor(list(key[1]), dtype=torch.int64, device=device)
         _STOP_T_CACHE[key] = t
     return t
+
+
+def repeat_best_legal(
+    vals: torch.Tensor,
+    rows: Sequence[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Copy survivor 0 into slots whose score is not finite.
+
+    A beam that has fewer legal trie children than its width used to keep the
+    rejected token id in those slots (parent 0's unconstrained top token, or
+    token 0). Every such slot decoded to the same illegal SID. Survivor 0 is
+    the best legal child when any exist; scores are left unchanged.
+    """
+    finite = torch.isfinite(vals)
+    dup = (~finite) & finite[..., :1]
+    filled = []
+    for row in rows:
+        filled.append(torch.where(dup, row[..., :1].expand_as(row), row))
+    return filled
 
 
 def _map_candidate_tokens(

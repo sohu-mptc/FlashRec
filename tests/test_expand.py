@@ -6,12 +6,28 @@ from flashrec.search.expand import (
     init_from_prefill,
     init_from_prefill_batch,
     joint_select,
+    repeat_best_legal,
 )
 from flashrec.search.score import beam_score
 from flashrec.search.trie import BeamValidPathTrie
 
 
 class TestExpand:
+    def test_repeat_best_legal_fills_dead_slots(self):
+        vals = torch.tensor([[1.0, 0.5, float("-inf"), float("-inf")]])
+        parents = torch.tensor([[2, 4, 0, 7]])
+        tokens = torch.tensor([[10, 11, 99, 98]])
+        parents, tokens = repeat_best_legal(vals, (parents, tokens))
+        assert parents.tolist() == [[2, 4, 2, 2]]
+        assert tokens.tolist() == [[10, 11, 10, 10]]
+        # An all-dead plane has no legal survivor to copy.
+        dead_vals = torch.tensor([[float("-inf"), float("-inf")]])
+        dead_parents = torch.tensor([[0, 3]])
+        dead_tokens = torch.tensor([[99, 98]])
+        kept_p, kept_t = repeat_best_legal(dead_vals, (dead_parents, dead_tokens))
+        assert torch.equal(kept_p, dead_parents)
+        assert torch.equal(kept_t, dead_tokens)
+
     def test_beam_score_matches_sglang_formula(self):
         assert round(abs(beam_score(-4.0, 2, 1.0) - -2.0), 7) == 0
         assert round(abs(beam_score(-8.0, 4, 1.0) - -2.0), 7) == 0
@@ -494,6 +510,50 @@ class TestExpand:
         assert tuple(out.vals.shape) == (n, bw)
         assert tuple(out.parents.shape) == (n, bw)
 
+    def test_dead_slots_repeat_best_legal_token(self):
+        """Fewer legal children than select_k must not emit a masked token."""
+        from flashrec.kernel import beam_trie as bt
+
+        if not torch.cuda.is_available() or not bt.try_load_beam_trie():
+            pytest.skip("beam_trie JIT unavailable")
+        dev = torch.device("cuda")
+        n, bw, c, k = 1, 4, 2, 4
+        # Parent 0's top token is 7, and 7 is illegal. The only legal token is 3
+        # on parent 1. Every output slot must be that legal token.
+        cum = torch.zeros(n, bw, device=dev)
+        top_lp = torch.tensor(
+            [[[0.0, -1.0], [-5.0, -4.0], [-3.0, -2.0], [-6.0, -7.0]]],
+            device=dev,
+        )
+        top_tok = torch.tensor(
+            [[[7, 8], [3, 9], [4, 5], [6, 1]]],
+            dtype=torch.int64,
+            device=dev,
+        )
+        allow = torch.zeros(2, 16, dtype=torch.uint8, device=dev)
+        allow[0, 3] = 1
+        nodes = torch.zeros(n, bw, dtype=torch.int64, device=dev)
+        token_ids = torch.arange(n * bw * 3, device=dev, dtype=torch.int64).view(n, bw, 3)
+        next_node = torch.zeros(2, 16, dtype=torch.int64, device=dev)
+        next_node[0, 3] = 1
+        out = bt.genrec_mask_topk_expand(
+            cum,
+            top_lp,
+            top_tok,
+            select_k=k,
+            node_ids=nodes,
+            allow_table=allow,
+            token_base=0,
+            token_ids=token_ids,
+            col=2,
+            next_node=next_node,
+            invalid_node=0,
+        )
+        assert out.tokens.tolist() == [[3, 3, 3, 3]]
+        assert out.token_ids[0, :, 2].tolist() == [3, 3, 3, 3]
+        assert torch.isfinite(out.vals[0, 0])
+        assert not torch.isfinite(out.vals[0, 1])
+
     def test_split_select_matches_fused(self):
         """The radix-select path must pick exactly what the K-way merge picks.
 
@@ -502,7 +562,8 @@ class TestExpand:
         =1000 that is 2.26ms and 97.5% of the kernel. call_genrec_split does the
         same masked-plane argmax with torch.topk in 64us. Both take the max of
         the same plane, so the outputs must agree bit for bit -- including the
-        parent/token/index reported for dead slots that had no legal child.
+        parent/token/index of dead slots, which repeat survivor 0 when it is
+        legal and otherwise stay on the all-dead sentinel.
         """
         from flashrec.kernel import beam_trie as bt
 
