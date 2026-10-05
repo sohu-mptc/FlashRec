@@ -20,7 +20,28 @@ __all__ = [
     "repeat_best_legal",
     "apply_temperature",
     "gumbel_like",
+    "trie_candidate_width",
 ]
+
+# Codebooks at or under this width are masked in full. A ``2 * beam`` window
+# drops trie-legal children, and the following top-k then pads the beam with
+# those illegal ids (catalog_miss). OneRec's 8192-wide levels stay narrow:
+# their legal mass already lands inside ``2 * beam``.
+_FULL_CODEBOOK_MASK_MAX = 4096
+
+
+def trie_candidate_width(beam_width: int, vocab: int, constrain: bool) -> int:
+    """How many logits to keep before the trie mask.
+
+    ``constrain`` is the trie being active. Small codebooks are returned
+    whole so every legal child is visible to the mask.
+    """
+    vocab = max(int(vocab), 1)
+    bw = max(int(beam_width), 1)
+    narrow = min(max(bw * 2, bw), vocab)
+    if constrain and vocab <= _FULL_CODEBOOK_MASK_MAX:
+        return vocab
+    return narrow
 
 
 def apply_temperature(logprobs: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -120,9 +141,17 @@ def init_from_prefill(
     sw = int(select_width) if select_width is not None else int(beam_width)
     sw = max(min(sw, int(beam_width)), 1)
     logprobs = apply_temperature(logprobs, temperature)
-    topk = min(int(beam_candidates), int(logprobs.shape[0]), int(logprobs.numel()))
-    if topk < sw:
-        raise ValueError(f"topk={topk} < select_width={sw}")
+    topk = trie_candidate_width(
+        beam_width,
+        int(logprobs.shape[0]),
+        valid_path is not None and valid_path.active,
+    )
+    topk = min(topk, int(logprobs.shape[0]), int(logprobs.numel()))
+    # Beam may exceed the SID candidate window (e.g. MiniOneRec n=1000 on a
+    # 560-wide codebook); clamp rather than failing the request.
+    sw = min(sw, topk)
+    if sw < 1:
+        raise ValueError(f"empty candidate window: topk={topk}")
     vals, idx = logprobs.topk(topk, dim=0, sorted=True)
     tokens = _map_candidate_tokens(idx, candidate_token_ids)
     vals = vals.to(dtype=torch.float32)
@@ -167,6 +196,8 @@ def init_from_prefill(
         sel_vals = vals[:take].contiguous()
         sel_tokens = tokens[:take].contiguous()
         sw = take
+
+    (sel_tokens,) = repeat_best_legal(sel_vals, (sel_tokens,))
 
     bl = BeamSearchList()
     bl.completed = []
@@ -220,9 +251,15 @@ def init_from_prefill_batch(
     sw = int(select_width) if select_width is not None else int(beam_width)
     sw = max(min(sw, int(beam_width)), 1)
     logprobs = apply_temperature(logprobs, temperature)
-    topk = min(int(beam_candidates), int(logprobs.shape[1]))
-    if topk < sw:
-        raise ValueError(f"topk={topk} < select_width={sw}")
+    topk = trie_candidate_width(
+        beam_width,
+        int(logprobs.shape[1]),
+        valid_path is not None and valid_path.active,
+    )
+    topk = min(topk, int(logprobs.shape[1]))
+    sw = min(sw, topk)
+    if sw < 1:
+        raise ValueError(f"empty candidate window: topk={topk}")
     vals, idx = logprobs.topk(topk, dim=1, sorted=True)
     tokens = _map_candidate_tokens(idx, candidate_token_ids)
     vals = vals.to(dtype=torch.float32)
@@ -240,6 +277,8 @@ def init_from_prefill_batch(
     else:
         sel_vals = vals[:, :sw].contiguous()
         sel_tokens = tokens[:, :sw].contiguous()
+
+    (sel_tokens,) = repeat_best_legal(sel_vals, (sel_tokens,))
 
     node_ids_all = None
     if valid_path is not None and valid_path.active and valid_path.mode == "trie":
@@ -437,6 +476,7 @@ def expand_step(
         vals, idx = torch.topk(flat_scores, k=k, largest=True, sorted=True)
     parents = idx // topk
     toks = tt.reshape(-1).gather(0, idx)
+    parents, toks = repeat_best_legal(vals, (parents, toks))
     beam_list.expand_token_ids(parents, toks)
     beam_list.cum_logprobs = vals
     beam_list.last_tokens = toks

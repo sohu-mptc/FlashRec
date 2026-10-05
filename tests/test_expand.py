@@ -147,6 +147,26 @@ class TestExpand:
         # 2 and 4 are illegal after prefix [3]; token 1 must win despite worse raw score.
         assert int(bl.last_tokens[0].item()) == 1
 
+    def test_init_repeats_legal_token_outside_narrow_window(self):
+        """A 2*beam window used to miss the only legal first code and emit it anyway."""
+        trie = BeamValidPathTrie(mode="trie")
+        trie.children[()] = {5}
+        trie.max_depth = 1
+        trie.all_tokens = {5}
+        trie.finalize_index(token_base=0, vocab_size=6)
+        logprobs = torch.tensor(
+            [-0.1, -0.2, -0.3, -0.4, -0.5, -4.0], dtype=torch.float32
+        )
+        bl = init_from_prefill(
+            logprobs,
+            beam_width=3,
+            beam_candidates=2,
+            max_new_tokens=2,
+            prompt_len=1,
+            valid_path=trie,
+        )
+        assert bl.last_tokens.tolist() == [5, 5, 5]
+
     def test_genrec_cuda_matches_pytorch(self):
         from flashrec.kernel.beam_trie import (
             genrec_mask_topk_expand,

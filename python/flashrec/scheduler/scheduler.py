@@ -44,6 +44,7 @@ from flashrec.search.expand import (
     expand_step,
     init_from_prefill,
     init_from_prefill_batch,
+    trie_candidate_width,
 )
 from flashrec.search.budget import (
     expand_group_tbb,
@@ -214,7 +215,7 @@ class BeamRecEngine:
             nxt = nxt.to(dtype=torch.int64)
         return ExpandCaptureSpec(
             beam_width=bw,
-            cand=min(max(bw * 2, bw), k),
+            cand=trie_candidate_width(bw, k, True),
             select_k=bw,
             width=int(self.config.max_tokens),
             cand_ids=self.runner.lm_head.token_ids.contiguous(),
@@ -279,7 +280,7 @@ class BeamRecEngine:
                 nxt = nxt.to(dtype=torch.int64)
             espec = ExpandCaptureSpec(
                 beam_width=bw,
-                cand=min(max(bw * 2, bw), k),
+                cand=trie_candidate_width(bw, k, True),
                 select_k=bw,
                 width=width,
                 cand_ids=cand_ids.contiguous(),
@@ -2204,7 +2205,9 @@ class BeamRecEngine:
                 logger.debug("fused expand fallback", exc_info=True)
         for req in reqs:
             bw = int(req.beam_width)
-            topk = min(req.beam_candidates, int(logprobs.shape[1]))
+            topk = trie_candidate_width(
+                req.beam_width, int(logprobs.shape[1]), self.valid_path.active
+            )
             row = logprobs[offset : offset + bw]
             # Temperature rescaling must see the full row (renormalization is
             # only exact over the whole candidate vocabulary), so it happens
@@ -2236,7 +2239,9 @@ class BeamRecEngine:
     ) -> None:
         n = len(reqs)
         bw = int(reqs[0].beam_width)
-        topk = min(reqs[0].beam_candidates, int(logprobs.shape[1]))
+        topk = trie_candidate_width(
+            bw, int(logprobs.shape[1]), self.valid_path.active
+        )
         stacked = logprobs.view(n, bw, -1)
         if stacked.shape[-1] > topk:
             vals, idx = torch.topk(stacked, topk, dim=-1, largest=True, sorted=True)
