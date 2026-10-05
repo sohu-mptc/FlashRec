@@ -25,11 +25,13 @@ def parse_int_list(value: Optional[Union[str, Sequence[int]]]) -> Optional[List[
 
 
 def parse_sid_spec(value: str) -> Tuple[str, str, str]:
-    """Parse compact SID layout ``START:END/SIZE,...``.
+    """Parse compact SID layout ``START:END/SIZE,...[@BEGIN,END]``.
 
     Returns ``(token_range, codebook_sizes, boundary_tokens)`` as strings.
     Boundary tokens are the last codebook when its size is 2 (RecIF 4-level
     ``...,2``); otherwise they are the two ids immediately after ``END``.
+    Optional ``@BEGIN,END`` overrides that pair. SoHu-0.6B's packed 512×3
+    window keeps ``<|sid_begin|>`` / ``<|sid_end|>`` outside the window.
     """
     text = str(value).strip()
     if "/" not in text:
@@ -39,6 +41,11 @@ def parse_sid_spec(value: str) -> Tuple[str, str, str]:
     range_s, sizes_s = text.split("/", 1)
     range_s = range_s.strip()
     sizes_s = sizes_s.strip()
+    boundary_override: Optional[str] = None
+    if "@" in sizes_s:
+        sizes_s, boundary_override = sizes_s.split("@", 1)
+        sizes_s = sizes_s.strip()
+        boundary_override = boundary_override.strip()
     if ":" not in range_s or "," in range_s:
         raise ValueError(f"sid spec range must be START:END, got {range_s!r}")
     start_s, end_s = range_s.split(":", 1)
@@ -52,7 +59,14 @@ def parse_sid_spec(value: str) -> Tuple[str, str, str]:
     n_ids = end - start + 1
     if need > n_ids:
         raise ValueError(f"sid spec codebook sum ({need}) exceeds range size ({n_ids})")
-    if sizes[-1] == 2:
+    if boundary_override:
+        parts = [p.strip() for p in boundary_override.split(",") if p.strip()]
+        if len(parts) != 2:
+            raise ValueError(
+                f"sid spec @boundary must be BEGIN,END, got {boundary_override!r}"
+            )
+        b0, b1 = int(parts[0]), int(parts[1])
+    elif sizes[-1] == 2:
         b0 = start + need - 2
         b1 = start + need - 1
     else:

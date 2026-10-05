@@ -33,6 +33,22 @@ class TestParseSidSpec:
         with pytest.raises(ValueError):
             parse_sid_spec("0:3/2,2,2")
 
+    def test_boundary_override_after_at(self):
+        token_range, sizes, boundary = parse_sid_spec(
+            "151669:153204/512,512,512@176245,176246"
+        )
+        assert token_range == "151669:153204"
+        assert sizes == "512,512,512"
+        assert boundary == "176245,176246"
+
+    def test_depth3_without_override_still_follows_range(self):
+        _, _, boundary = parse_sid_spec("151669:153204/512,512,512")
+        assert boundary == "153205,153206"
+
+    def test_bad_boundary_override(self):
+        with pytest.raises(ValueError):
+            parse_sid_spec("151669:153204/512,512,512@176245")
+
 
 class TestBeamRecConfigSid:
     def test_sid_fills_the_three_fields(self):
@@ -71,6 +87,15 @@ class TestBeamRecConfigSid:
                 sid="151669:176246/8192,8192,8192,2",
                 sid_boundary_tokens="0,1",
             )
+
+    def test_sohu06_override_fills_boundary(self):
+        cfg = BeamRecConfig(
+            model_path="/tmp/model",
+            sid="151669:153204/512,512,512@176245,176246",
+        )
+        assert cfg.sid_token_range == "151669:153204"
+        assert cfg.sid_codebook_sizes == "512,512,512"
+        assert cfg.parsed_boundary_token_ids() == [176245, 176246]
 
     def test_unset_sid_leaves_fields_none(self):
         cfg = BeamRecConfig(model_path="/tmp/model")
