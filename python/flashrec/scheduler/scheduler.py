@@ -2111,7 +2111,11 @@ class BeamRecEngine:
                 pl = int(req.prompt_len)
                 if pl <= 0:
                     return None
-                qo0.append(qo0[-1] + int(req.beam_width))
+                # live_width, not the allocated beam_width. Trie-budget and
+                # sparse top-k shrink the driven rows before the first decode
+                # step; L1 is sized to that live count, and a stale L0 width
+                # makes the cascade CUDA-graph plan reject the batch.
+                qo0.append(qo0[-1] + int(req.live_width))
                 kv0.append(kv0[-1] + pl)
                 idx0.append(table[int(rows_cpu[0]), :pl])
             l0 = (
@@ -2143,7 +2147,7 @@ class BeamRecEngine:
             kv1 = [0]
             for req, d in zip(reqs, dec_lens):
                 base = kv1[-1]
-                kv1.extend(base + d * (i + 1) for i in range(int(req.beam_width)))
+                kv1.extend(base + d * (i + 1) for i in range(int(req.live_width)))
             kv1_t = torch.tensor(kv1, dtype=torch.int32)
         same_prompt = len(set(prompt_lens)) == 1
         pool = self._wave_pool_rows
@@ -2158,6 +2162,9 @@ class BeamRecEngine:
             idx1_parts: List[torch.Tensor] = []
             for req, pl, d in zip(reqs, prompt_lens, dec_lens):
                 rows = req.beam_pool_indices.view(-1)
+                lw = int(req.live_width)
+                if int(rows.shape[0]) != lw:
+                    rows = rows[:lw]
                 if rows.dtype != torch.int64:
                     rows = rows.to(dtype=torch.int64)
                 idx1_parts.append(table.narrow(1, pl, d).index_select(0, rows).reshape(-1))

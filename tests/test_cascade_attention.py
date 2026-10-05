@@ -312,3 +312,40 @@ def test_can_replay_cascade_reserves_dummy_slot():
     assert not runner.can_replay_cascade(17, 4)
     assert runner.can_replay_cascade(32, 4)
     assert not runner.can_replay_cascade(33, 1)
+
+
+def test_cascade_meta_follows_live_width():
+    """Trie-budget can shrink a beam below its allocated width before decode.
+
+    L0 query rows and L1 indices must follow live_width. Using beam_width
+    makes kv1 shorter than qo0[-1] + 1 and the cascade CUDA-graph plan rejects
+    the batch (wide beams, full variant).
+    """
+    from types import SimpleNamespace
+
+    from flashrec.core import BeamRequest
+    from flashrec.scheduler.scheduler import BeamRecEngine
+
+    def req(width: int, live: int, prompt: int, seq: int, pool0: int) -> BeamRequest:
+        item = BeamRequest(input_ids=[1], beam_width=width, max_new_tokens=5)
+        item.prompt_len = prompt
+        item.seq_len = seq
+        item.beam_list.last_tokens = torch.zeros(live, dtype=torch.int64)
+        item.beam_pool_indices_cpu = list(range(pool0, pool0 + width))
+        item.beam_pool_indices = torch.arange(pool0, pool0 + width)
+        return item
+
+    # Two requests, different decode depths, so L1 takes the per-request path.
+    reqs = [req(500, 200, 8, 9, 0), req(500, 248, 8, 10, 500)]
+    table = torch.arange(1200 * 16, dtype=torch.int32).reshape(1200, 16)
+    sched = SimpleNamespace(
+        _wave_cascade_l0=None,
+        _wave_cascade_l1=None,
+        _wave_pool_rows=None,
+        runner=SimpleNamespace(req_pool=SimpleNamespace(req_to_token=table)),
+    )
+    meta = BeamRecEngine._build_cascade_meta(sched, reqs, 448)
+    assert int(meta.qo_indptr[0][-1]) == 448
+    assert int(meta.kv_indptr[1].numel()) == 449
+    # dec depths 1 and 2, live rows only: 200 * 1 + 248 * 2
+    assert int(meta.kv_indices[1].numel()) == 200 + 248 * 2
