@@ -100,6 +100,14 @@ def expand_group_tbb(
     for the whole group (the surviving widths shape next step's tensors).
     With ``tau <= 0`` the width is ``select_k`` and nothing syncs.
 
+    Children that are already one catalog item (``leaf_count <= 1``) are not
+    shrunk. OneRec's last code is that case: every survivor has a single
+    forced ``sid_end``, so a tau prefix keeps about ``tau`` of the beam
+    (192 / 480 / 928 after the multiple-of-32 round) and unary finish freezes
+    it. SoHu's last expand has ``remain <= 1``, so the caller passes
+    ``tau == 0`` and the beam stays full. Unit leaf mass has nothing to
+    cover — dropping a beam drops one item.
+
     Returns per-request relative parent indices for the KV remap, or ``None``
     when the group cannot be batched (caller falls back to the per-request
     loop).
@@ -155,6 +163,12 @@ def expand_group_tbb(
         )
         lo = min(max(int(n_min), 1), k)
         kvec = kvec.clamp(lo, k)
+        # OneRec last code: every child is one item (leaf_count <= 1) sitting
+        # above a forced sid_end. Equal unit mass makes the prefix ~tau * k,
+        # and the unary finish that follows cannot grow the beam back.
+        # SoHu never takes this branch (last step is tau=0). Keep select_k.
+        unit_leaf = w.max(dim=1).values <= 1
+        kvec = torch.where(unit_leaf, torch.full_like(kvec, k), kvec)
         # Round surviving widths up to a multiple of 32: keeps a few extra
         # beams (never fewer), and requests that shrank alike stay in one
         # lock-step group instead of fragmenting into per-width groups.

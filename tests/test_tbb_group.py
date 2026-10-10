@@ -153,6 +153,48 @@ class TestCoverageBudget:
         # With rounding to 32 capped at k=24 the width must be 24.
         assert bl.cum_logprobs.shape[0] == 24
 
+    def test_unit_leaf_keeps_full_beam(self):
+        """OneRec's last code is one item per child; tau must not drop beams.
+
+        leaf_count == 1 for every survivor makes the tau=0.9 prefix
+        ceil(0.9 * k), then the multiple-of-32 round: 200 → 192, 500 → 480,
+        1000 → 928. SoHu's last step passes tau=0 and stays full. The unary
+        sid_end that follows cannot grow the beam, so this step has to.
+        """
+        live, d, width, col = 8, 32, 4, 1
+        deg = torch.full((live,), d, dtype=torch.int32)
+        scores = _sorted_scores(live, d, deg, seed=17)
+        bl = _beam_list(live, width, col, seed=8)
+        leaf = torch.ones(50, dtype=torch.int32)
+        parents = expand_group_tbb(
+            [bl],
+            scores,
+            live=live,
+            select_k=200,
+            tau=0.9,
+            n_min=64,
+            leaf_count=leaf,
+        )
+        assert parents is not None
+        assert bl.cum_logprobs.shape[0] == 200
+
+        # A child that actually covers many items still takes the tau prefix.
+        bl2 = _beam_list(live, width, col, seed=8)
+        peaked = leaf.clone()
+        flat = (bl2.cum_logprobs.unsqueeze(1) + scores.logprobs).reshape(-1)
+        top = int(torch.argmax(flat))
+        peaked[int(scores.children.reshape(-1)[top])] = 100_000
+        expand_group_tbb(
+            [bl2],
+            scores,
+            live=live,
+            select_k=200,
+            tau=0.9,
+            n_min=64,
+            leaf_count=peaked,
+        )
+        assert bl2.cum_logprobs.shape[0] < 200
+
     def test_tau_keeps_n_min_floor(self):
         live, d, width, col = 2, 4, 6, 1
         deg = torch.full((live,), 4, dtype=torch.int32)
