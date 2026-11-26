@@ -72,10 +72,39 @@ class BeamRequest:
     # req_to_token back from GPU.
     prefill_kv_cpu_all: Optional[List[int]] = None
     expanded: bool = False
+    # Set when the scheduler moves the request into a real prefill batch. This
+    # excludes both the HTTP queue and the engine's internal waiting set.
+    admitted_at: Optional[float] = None
 
     @property
     def beam_candidates(self) -> int:
         return max(int(self.beam_width) * 2, int(self.beam_width))
+
+    @property
+    def live_width(self) -> int:
+        bl = self.beam_list
+        if bl is not None and bl.last_tokens is not None:
+            return max(int(bl.last_tokens.shape[0]), 1)
+        return max(int(self.beam_width), 1)
+
+
+@dataclass
+class CascadeMeta:
+    """Two-level cascade decode attention (FlashInfer MultiLevelCascade).
+
+    Level 0: one block per request covering its beam rows; kv = the prompt
+    pages every beam of that request shares (columns ``[:prompt_len]`` of
+    ``req_to_token``, identical across rows after ``copy_prefill_to_beams``).
+    Level 1: one block per beam row; kv = that row's own decode-history pages
+    (columns ``[prompt_len:seq_len]``). The prompt KV is thus read once per
+    request instead of once per beam row. indptr tensors are host int32 (plan
+    is a host op); indices tensors are device int32.
+    """
+
+    qo_indptr: List[torch.Tensor]  # [level0, level1]
+    kv_indptr: List[torch.Tensor]
+    kv_indices: List[torch.Tensor]
+    last_page_len: List[torch.Tensor]
 
 
 @dataclass
@@ -95,6 +124,8 @@ class ForwardBatch:
     kv_indptr: Optional[torch.Tensor] = None
     buffers_ready: bool = False  # decode graph static buffers already filled
     want_expand: bool = False
+    cascade: Optional[CascadeMeta] = None  # decode-only; graph when captured
+    codebook_level: Optional[int] = None  # per-level CUDA graph routing
 
     @property
     def n_rows(self) -> int:

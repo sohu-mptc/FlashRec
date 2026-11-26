@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -15,12 +16,13 @@ from flashrec.core import (
     BeamRequest,
     BeamResult,
     BeamSequence,
+    CascadeMeta,
     FinishReason,
     ForwardBatch,
 )
 from flashrec.engine.engine import ModelEngine
-from flashrec.engine.graph import ExpandCaptureSpec
-from flashrec.engine.staging import PinnedStage, fill_cpu_seq_lens
+from flashrec.engine.graph import ExpandCaptureSpec, LevelCaptureSpec
+from flashrec.engine.staging import PinnedStage
 from flashrec.hostpool import HostPool
 from flashrec.kernel.beam_trie import (
     GenrecFusedResult,
@@ -30,21 +32,33 @@ from flashrec.kernel.beam_trie import (
     rows_alias_stack,
     try_load_beam_trie,
 )
+from flashrec.kernel.trie_budget import MAX_DEG as TRIE_BUDGET_MAX_DEG
+from flashrec.kernel.trie_budget import try_load_trie_budget
 from flashrec.profiler import trace_range
-from flashrec.scheduler.batching import group_by_beam_depth
+from flashrec.scheduler.batching import (
+    admission_cost,
+    can_admit_kv,
+    group_by_beam_depth,
+)
 from flashrec.scheduler.kv_remap import remap_by_parents
 from flashrec.scheduler.loop import InflightLoop
 from flashrec.scheduler.pipeline import DecodePipeline
 from flashrec.scheduler.warmup import warmup_shared_prefix
+from flashrec.search.budget import (
+    expand_group_tbb,
+    target_select_k,
+    try_leaf_flush,
+)
 from flashrec.search.expand import (
     apply_temperature,
     expand_step,
     init_from_prefill,
     init_from_prefill_batch,
-    narrow_to_codebook_level,
+    trie_candidate_width,
 )
 from flashrec.search.score import beam_score
 from flashrec.search.trie import build_beam_valid_path
+from flashrec.search.unary import try_unary_finish_request
 from flashrec.tokenizer import TokenizerAdapter
 
 logger = logging.getLogger(__name__)
@@ -66,9 +80,37 @@ class _DecodeLaunch:
 class BeamRecEngine:
     def __init__(self, config: BeamRecConfig):
         self.config = config
+        self.path_stats: Dict[str, float] = {
+            "prefill_batches": 0,
+            "prefill_requests": 0,
+            "prefill_s": 0.0,
+            "decode_batches": 0,
+            "decode_rows": 0,
+            "decode_s": 0.0,
+            "graph_replay_batches": 0,
+            "eager_decode_batches": 0,
+            "level_graph_batches": 0,
+            "cascade_batches": 0,
+            "cascade_graph_batches": 0,
+            "expand_graph_batches": 0,
+            "expand_s": 0.0,
+            "fused_expand_batches": 0,
+            "fused_expand_fallback_batches": 0,
+            "eager_expand_batches": 0,
+            "decode_token_pack_batches": 0,
+            "decode_token_cat_batches": 0,
+            "finalize_batches": 0,
+            "finalize_requests": 0,
+            "finalize_s": 0.0,
+            "peak_decode_rows": 0,
+        }
+        self._beam_width_by_depth: Dict[int, Dict[str, int]] = {}
         self.runner = ModelEngine(config)
         self.device = self.runner.device
-        self.tokenizer = TokenizerAdapter(config.model_path)
+        self.tokenizer = TokenizerAdapter(
+            config.model_path,
+            codebook_sizes=config.parsed_codebook_sizes(),
+        )
         self.host_pool = HostPool(int(getattr(config, "host_worker_threads", 4) or 0))
         self.prefix_cache = self.runner.prefix_cache
         special = config.parsed_sid_token_ids()
@@ -92,14 +134,37 @@ class BeamRecEngine:
         self._last_prefill_ev = None
         self._wave_pool_rows: Optional[torch.Tensor] = None
         self._wave_seq_base: Optional[torch.Tensor] = None
-        self._wave_seq_base_cpu: Optional[torch.Tensor] = None
         self._wave_seq_base_sum: int = 0
         self._wave_reqs_key: Optional[tuple] = None
+        self._wave_live_key: Optional[tuple] = None
         self._wave_n_rows: int = 0
         self._wave_step: int = 0
         self._wave_ones: List[int] = []
+        # Level-0 cascade arrays (per-request shared prompt pages): constant
+        # within a wave, rebuilt whenever the wave cache misses.
+        self._wave_cascade_l0: Optional[tuple] = None
+        self._wave_cascade_l1: Optional[tuple] = None
+        self._level_node_offsets: Optional[List[int]] = None
+        self._level_tables: Optional[dict] = None
         depth = int(getattr(self.valid_path, "max_depth", 0) or 0)
         prefs = config.preferred_batch_sizes()
+        kv_check_fn = None
+        if bool(getattr(config, "enable_kv_admission", True)):
+            _kv_pool = self.runner.kv_pool
+            _max_tokens = int(config.max_tokens)
+
+            def _kv_ok(beam_width: int) -> bool:
+                return can_admit_kv(_kv_pool.available_size(), beam_width, _max_tokens)
+
+            kv_check_fn = _kv_ok
+        admit_unit = str(getattr(config, "admission_unit", "row") or "row")
+        admit_rows = int(getattr(config, "admission_request_rows", 0) or 0)
+
+        def _slot_cost(req) -> int:
+            return admission_cost(
+                int(getattr(req, "beam_width", 1)), admit_unit, admit_rows
+            )
+
         self.inflight = InflightLoop(
             slots=config.resolved_batch_slots(),
             preferred=prefs,
@@ -111,6 +176,15 @@ class BeamRecEngine:
             free_fn=self._free_reqs,
             pack_min=int(getattr(config, "decode_pack_min_requests", 6) or 6),
             pack_ratio=float(getattr(config, "decode_pack_ratio", 0.75) or 0.75),
+            kv_check_fn=kv_check_fn,
+            slot_cost_of=_slot_cost,
+            row_cap=config.resolved_batch_slots(),
+        )
+        logger.info(
+            "admission unit=%s request_rows=%s slot_budget=%s",
+            admit_unit,
+            admit_rows,
+            config.resolved_batch_slots(),
         )
         if self.device.type == "cuda":
             self.valid_path._ensure_gpu_cache(self.device)
@@ -118,6 +192,30 @@ class BeamRecEngine:
                 logger.info("beam_trie JIT loaded")
             else:
                 logger.info("beam_trie JIT fallback (PyTorch)")
+        # Fused sparse scorer: reads lm_head rows in place instead of gathering
+        # [rows, deg, H], and sizes its plane from the trie's static max outdeg,
+        # so the sparse decode step no longer syncs on deg.max().item().
+        self._fused_sparse_score = bool(
+            self.device.type == "cuda"
+            and getattr(config, "enable_fused_sparse_score", True)
+            and try_load_trie_budget()
+        )
+        if self.device.type == "cuda":
+            logger.info(
+                "fused sparse scorer: %s",
+                "on" if self._fused_sparse_score else "off (PyTorch sparse path)",
+            )
+        # The line above only says whether the fused KERNEL loaded. Whether the
+        # sparse (legal-set) scorer is used at all is a separate switch, and a
+        # run that disables it must be auditable from the server log.
+        logger.info(
+            "sparse lm_head (legal-set scoring): %s",
+            (
+                "enabled"
+                if bool(getattr(config, "enable_sparse_lm_head", False))
+                else "disabled (full-codebook scoring)"
+            ),
+        )
         if config.enable_warmup:
             n_warm = warmup_shared_prefix(self)
             if n_warm:
@@ -140,8 +238,121 @@ class BeamRecEngine:
         spec = self._expand_capture_spec()
         self.runner.ensure_cuda_graph(expand_spec=spec)
         if self.runner.graph is not None:
-            # Replay stays on the capture stream; expand overlaps on expand_stream.
             self.pipeline.ensure_streams()
+            self._capture_level_graphs()
+        self.log_serving_path()
+
+    def log_serving_path(self) -> None:
+        """One line the ablation runner greps after the port opens.
+
+        Values are space-free so ``key=value`` splits cleanly. Empty lists
+        are ``-``. ``graph`` here is capture success, not the earlier init
+        log (capture runs on the worker after that line).
+        """
+        graph = self.runner.graph
+        vp = self.valid_path
+
+        def joined(values: list) -> str:
+            return ",".join(str(v) for v in values) if values else "-"
+
+        captured: list = []
+        expand: list = []
+        cascade: list = []
+        level: list = []
+        if graph is not None:
+            captured = sorted(graph.graphs)
+            expand = sorted(graph.graphs_expand)
+            cascade = sorted(graph.graphs_cascade)
+            level = [f"{bs}:{lv}" for bs, lv in sorted(graph.graphs_level)]
+        if vp is None or not getattr(vp, "active", False):
+            layout = "fullvocab"
+            trie_mode = "none"
+        else:
+            trie_mode = str(getattr(vp, "mode", None) or "none")
+            if getattr(vp, "_allow_table", None) is not None:
+                layout = "dense"
+            elif (
+                getattr(vp, "_csr_keys", None) is not None
+                or getattr(vp, "_csr_rowptr", None) is not None
+            ):
+                layout = "csr"
+            elif trie_mode == "codebook":
+                layout = "codebook"
+            elif trie_mode == "none":
+                layout = "fullvocab"
+            else:
+                layout = trie_mode
+        logger.info(
+            "serving path: graph=%s trie_mode=%s expand=%s radix=%s cascade=%s "
+            "quant=%s kv=%s layout=%s level_graph=%s captured=%s "
+            "cascade_captured=%s expand_captured=%s level_captured=%s",
+            bool(captured),
+            trie_mode,
+            bool(expand) and bool(self.config.enable_graph_expand),
+            self.prefix_cache is not None,
+            bool(self.config.enable_cascade_attention),
+            self.config.quantization or "-",
+            self.config.kv_cache_dtype or "-",
+            layout,
+            bool(self.config.enable_level_graph),
+            joined(captured),
+            joined(cascade),
+            joined(expand),
+            joined(level),
+        )
+
+    def path_snapshot(self) -> Dict[str, float]:
+        snap: Dict[str, float] = {}
+        for key, value in self.path_stats.items():
+            if key.endswith("_s"):
+                snap[key] = round(float(value), 6)
+            else:
+                snap[key] = int(value)
+        loop = getattr(self, "inflight", None)
+        if loop is not None:
+            for key in (
+                "stat_prefill_waves",
+                "stat_prefill_requests",
+                "stat_prefill_multi_waves",
+                "stat_decode_waves",
+                "stat_decode_requests",
+                "stat_decode_multi_waves",
+                "stat_decode_max_requests",
+                "stat_decode_max_rows",
+            ):
+                snap[key] = int(getattr(loop, key, 0))
+        return snap
+
+    def _account_decode(
+        self,
+        n_rows: int,
+        n_reqs: int,
+        *,
+        kind: str,
+        cascade: bool,
+        expand_graph: bool,
+        elapsed: float,
+    ) -> None:
+        del n_reqs
+        st = self.path_stats
+        rows = int(n_rows)
+        st["decode_batches"] += 1
+        st["decode_rows"] += rows
+        st["decode_s"] += float(elapsed)
+        if rows > int(st["peak_decode_rows"]):
+            st["peak_decode_rows"] = rows
+        if kind in ("graph", "level_graph"):
+            st["graph_replay_batches"] += 1
+        else:
+            st["eager_decode_batches"] += 1
+        if kind == "level_graph":
+            st["level_graph_batches"] += 1
+        if cascade:
+            st["cascade_batches"] += 1
+            if kind == "graph":
+                st["cascade_graph_batches"] += 1
+        if expand_graph:
+            st["expand_graph_batches"] += 1
 
     def _expand_capture_spec(self) -> Optional[ExpandCaptureSpec]:
         if not self.config.enable_graph_expand or not self.config.enable_fused_expand:
@@ -158,6 +369,26 @@ class BeamRecEngine:
         if not self.runner.lm_head.ready or not self.runner.lm_head.num_tokens:
             return None
         vp._ensure_gpu_cache(self.device)
+        if vp._csr_rowptr is not None:
+            from flashrec.kernel.csr_trie import module
+
+            module()  # Compile before entering any existing capture region.
+            bw = int(self.config.beam_width)
+            k = int(self.runner.lm_head.num_tokens)
+            return ExpandCaptureSpec(
+                beam_width=bw,
+                cand=trie_candidate_width(bw, k, True),
+                select_k=bw,
+                width=int(self.config.max_tokens),
+                cand_ids=self.runner.lm_head.token_ids,
+                allow_table=None,
+                next_node=None,
+                token_base=int(vp.token_base or 0),
+                invalid_node=int(vp._invalid_node),
+                csr_rowptr=vp._csr_rowptr,
+                csr_columns=vp._csr_columns,
+                csr_children=vp._csr_child,
+            )
         if vp._allow_table is None or vp._next_node is None:
             return None
         bw = int(self.config.beam_width)
@@ -172,7 +403,7 @@ class BeamRecEngine:
             nxt = nxt.to(dtype=torch.int64)
         return ExpandCaptureSpec(
             beam_width=bw,
-            cand=min(max(bw * 2, bw), k),
+            cand=trie_candidate_width(bw, k, True),
             select_k=bw,
             width=int(self.config.max_tokens),
             cand_ids=self.runner.lm_head.token_ids.contiguous(),
@@ -181,6 +412,102 @@ class BeamRecEngine:
             token_base=int(vp.token_base or 0),
             invalid_node=int(vp._invalid_node),
         )
+
+    def _capture_level_graphs(self) -> None:
+        """Build per-level LevelCaptureSpecs and capture per-level CUDA graphs."""
+        if not bool(getattr(self.config, "enable_level_graph", True)):
+            return
+        graph = self.runner.graph
+        if graph is None:
+            return
+        # Recapturing every generate_many rebuilds ~270MB level-1 tables and
+        # recaptures 24+ graphs into the shared pool; the second capture's
+        # first replay already dropped s_b (token 0).
+        if graph.graphs_level:
+            return
+        if not self.runner._per_codebook or not self.runner.lm_head.per_codebook_ready:
+            return
+        vp = self.valid_path
+        if not vp.active or vp.mode != "trie":
+            return
+        if not try_load_beam_trie():
+            return
+        cb = self.config.parsed_codebook_sizes()
+        if not cb:
+            return
+        vp._ensure_gpu_cache(self.device)
+        if vp._csr_rowptr is not None:
+            from flashrec.kernel.csr_trie import module
+
+            module()
+            level_tables = {}
+            base = int(vp.token_base or 0)
+            for level, size in enumerate(cb):
+                cand_ids = self.runner.lm_head._level_token_ids[level]
+                level_tables[level] = (None, None, base, cand_ids)
+                base += size
+        else:
+            level_tables = vp.build_level_tables(cb, device=self.device)
+        if not level_tables:
+            return
+        self._level_tables = level_tables
+        self._level_node_offsets = (
+            [0] * len(cb) if vp._csr_rowptr is not None else vp.level_node_offsets()
+        )
+        bw = int(self.config.beam_width)
+        width = int(self.config.max_tokens)
+        invalid = int(vp._invalid_node)
+        lm_head = self.runner.lm_head
+        model_lm_weight = self.runner.model.lm_head()
+        specs: Dict[int, LevelCaptureSpec] = {}
+        for level, (allow_t, next_t, level_tb, cand_ids) in level_tables.items():
+            k = int(lm_head.codebook_k(level))
+            if k <= 0 or bw <= 0:
+                continue
+            level_weight = lm_head._level_weights[level]
+
+            def _make_logits_fn(w=level_weight):
+                import torch.nn.functional as _F
+
+                def fn(hidden: torch.Tensor, out: torch.Tensor) -> None:
+                    logits = _F.linear(hidden.to(dtype=w.dtype), w)
+                    out.copy_(_F.log_softmax(logits.float(), dim=-1))
+
+                return fn
+
+            allow = allow_t
+            if allow is not None and allow.dtype == torch.bool:
+                allow = allow.view(torch.uint8)
+            nxt = next_t
+            if nxt is not None and nxt.dtype != torch.int64:
+                nxt = nxt.to(dtype=torch.int64)
+            espec = ExpandCaptureSpec(
+                beam_width=bw,
+                cand=trie_candidate_width(bw, k, True),
+                select_k=bw,
+                width=width,
+                cand_ids=cand_ids.contiguous(),
+                allow_table=allow.contiguous() if allow is not None else None,
+                next_node=nxt.contiguous() if nxt is not None else None,
+                token_base=int(level_tb),
+                invalid_node=invalid,
+                csr_rowptr=vp._csr_rowptr,
+                csr_columns=vp._csr_columns,
+                csr_children=vp._csr_child if vp._csr_rowptr is not None else None,
+            )
+            specs[level] = LevelCaptureSpec(
+                level=level,
+                logits_fn=_make_logits_fn(),
+                logprobs_k=k,
+                expand_spec=espec,
+            )
+        if specs:
+            with torch.inference_mode():
+                graph.capture_levels(
+                    self.runner._model_fwd,
+                    self.runner.attn.prepare,
+                    specs,
+                )
 
     def _can_graph_expand(self, reqs: List[BeamRequest], n_rows: int) -> bool:
         graph = self.runner.graph
@@ -272,19 +599,76 @@ class BeamRecEngine:
                 buf["exp_do"][n:n_pad].zero_()
                 buf["exp_col"][n:n_pad].zero_()
 
+    def _fused_coverage_keep(
+        self,
+        req: BeamRequest,
+        node_ids: torch.Tensor,
+        *,
+        remain: int,
+    ) -> int:
+        """How many fused top-k survivors the coverage prefix keeps.
+
+        The fused decode path never reaches ``_expand_groups``, so without this
+        the trie-budget flag would trim the prefill frontier and the sparse
+        decode path but leave every fused step at full width — the two arms
+        would then differ in *which decode path they ran*, not only in beam
+        width, and the A/B would stop being single-variable. It also has to
+        come after the fact: ``genrec_mask_topk_expand`` already chose the top
+        ``k``, and the prefix is a prefix of that ranking, so trimming the
+        tail is the same rule the vectorized block applies before selecting.
+
+        Skipped on the final expand (``remain <= 1``), which must fill the
+        beam, matching ``_tbb_expand_group``.
+        """
+        k = int(node_ids.numel())
+        if k <= 0 or remain <= 1:
+            return k
+        tau = self._budget_tau()
+        vp = self.valid_path
+        if tau <= 0.0 or not vp.active or vp.mode != "trie":
+            return k
+        if not vp.ensure_unary_tables(node_ids.device) or vp._leaf_count is None:
+            return k
+        from flashrec.search.budget import coverage_select_count
+
+        table = vp._leaf_count.to(device=node_ids.device)
+        n_leaf = int(table.shape[0])
+        if n_leaf <= 0:
+            return k
+        leaf = table[node_ids.clamp(0, n_leaf - 1)]
+        # Out-of-range ids must contribute zero mass, not clamp to a real leaf.
+        leaf = torch.where(
+            (node_ids >= 0) & (node_ids < n_leaf),
+            leaf,
+            torch.zeros_like(leaf),
+        )
+        return coverage_select_count(
+            leaf, tau=tau, n_min=self._budget_floor(int(req.beam_width)), n_max=k
+        )
+
     def _apply_fused(self, reqs: List[BeamRequest], fused: GenrecFusedResult) -> None:
         for i, req in enumerate(reqs):
             col = int(req.beam_list.cur_len)
-            req.beam_list.cum_logprobs = fused.vals[i]
-            req.beam_list.last_tokens = fused.tokens[i]
-            req.beam_list.token_ids = fused.token_ids[i]
+            limit = self.generation_token_limit(req.max_new_tokens)
+            gen = int(req.beam_list.generated_len())
+            remain = limit - gen
+            vals, toks, parents = fused.vals[i], fused.tokens[i], fused.parents[i]
+            token_ids, node_ids = fused.token_ids[i], fused.node_ids
+            if node_ids is not None:
+                keep = self._fused_coverage_keep(req, node_ids[i], remain=remain)
+                if keep < int(node_ids[i].numel()):
+                    vals, toks, parents = vals[:keep], toks[:keep], parents[:keep]
+                    if token_ids is not None:
+                        token_ids = token_ids[:keep]
+                    node_ids = node_ids[:keep]
+            req.beam_list.cum_logprobs = vals
+            req.beam_list.last_tokens = toks
+            req.beam_list.token_ids = token_ids
             req.beam_list.cur_len = col + 1
             req.beam_list.dense_authoritative = True
-            if fused.node_ids is not None:
-                req.beam_list.node_ids = fused.node_ids[i]
-            limit = self.generation_token_limit(req.max_new_tokens)
+            if node_ids is not None:
+                req.beam_list.node_ids = node_ids[i]
             will_finish = req.beam_list.generated_len() >= limit
-            parents = fused.parents[i]
             if will_finish:
                 req.finished = True
                 req.finish_reason = FinishReason(
@@ -293,6 +677,10 @@ class BeamRecEngine:
             else:
                 self._remap_req(req, parents)
             req.expanded = True
+            if fused.node_ids is not None:
+                self._note_live_width(
+                    max(gen, 1), int(req.beam_width), int(parents.numel()), "fused"
+                )
 
     def _cuda_stream(self):
         if torch.cuda.is_available():
@@ -398,7 +786,8 @@ class BeamRecEngine:
     def generation_token_limit(self, max_new_tokens: int) -> int:
         requested = int(max_new_tokens)
         depth = int(getattr(self.valid_path, "max_depth", 0) or 0)
-        if self.boundary_ids is not None and depth > 0 and requested >= depth + 2:
+        # Catalog SID depth is the last codebook; extra tokens have no slice.
+        if depth > 0 and requested > depth:
             return depth
         return requested
 
@@ -565,6 +954,17 @@ class BeamRecEngine:
     def _prefill_for_loop(self, reqs: List[BeamRequest]) -> None:
         if not reqs:
             return
+        t0 = time.perf_counter()
+        try:
+            self._prefill_for_loop_impl(reqs)
+        finally:
+            self.path_stats["prefill_batches"] += 1
+            self.path_stats["prefill_requests"] += len(reqs)
+            self.path_stats["prefill_s"] += time.perf_counter() - t0
+
+    def _prefill_for_loop_impl(self, reqs: List[BeamRequest]) -> None:
+        if not reqs:
+            return
 
         def _run() -> None:
             if self.config.enable_prefill_batch:
@@ -574,7 +974,17 @@ class BeamRecEngine:
                     self._prefill_batch([req])
 
         if not self._prefill_overlap():
-            _run()
+            try:
+                _run()
+            except Exception:
+                # Prefill pops waiting reqs before this returns. If slot/KV
+                # alloc fails mid-wave, free whatever was already reserved or
+                # the next wave death-spirals into 500s.
+                try:
+                    self._free_reqs(reqs)
+                except Exception:
+                    logger.exception("prefill failure cleanup also failed")
+                raise
             return
         ps = self.pipeline.prefill_stream
         if self._last_prefill_ev is not None:
@@ -602,6 +1012,17 @@ class BeamRecEngine:
             self._free_request(req)
 
     def _complete_reqs(self, reqs: List[BeamRequest]) -> None:
+        if not reqs:
+            return
+        t0 = time.perf_counter()
+        try:
+            self._complete_reqs_impl(reqs)
+        finally:
+            self.path_stats["finalize_batches"] += 1
+            self.path_stats["finalize_requests"] += len(reqs)
+            self.path_stats["finalize_s"] += time.perf_counter() - t0
+
+    def _complete_reqs_impl(self, reqs: List[BeamRequest]) -> None:
         if not reqs:
             return
         need_free = [
@@ -683,6 +1104,9 @@ class BeamRecEngine:
                 req_idx = self.runner.alloc_req_one()
                 req.prefill_pool_idx = req_idx
                 full_cpu = prefix_list + suffix_cpu
+                # Attach before later init so a mid-wave slot/KV failure can
+                # still return these pages in `_free_request`.
+                req.prefill_kv_cpu = list(full_cpu)
                 kv_writes.append((full_cpu, table[req_idx, : len(full_cpu)]))
                 prepared.append(
                     (req, ids, hit_len, suffix_ids, suffix_kv, None, full_cpu)
@@ -931,10 +1355,6 @@ class BeamRecEngine:
             )
         return out
 
-    def _codebook_sizes(self) -> Optional[List[int]]:
-        sizes = self.config.parsed_codebook_sizes()
-        return list(sizes) if sizes else None
-
     def _init_wave_precompute(
         self,
         prepared: List[tuple],
@@ -967,11 +1387,6 @@ class BeamRecEngine:
                 or limit <= 1
             ):
                 return None
-        # Prefill seeds beam 0 from codebook 0 only — same collapse hazard as
-        # decode when wrong-level tokens dominate a full-vocab top-k.
-        logprobs, cand_ids = narrow_to_codebook_level(
-            logprobs, cand_ids, self._codebook_sizes(), level=0
-        )
         bls = init_from_prefill_batch(
             logprobs,
             beam_width=bw,
@@ -983,7 +1398,14 @@ class BeamRecEngine:
                 cand_ids if isinstance(cand_ids, torch.Tensor) else None
             ),
             temperature=temp,
+            select_width=self._budget_select_width(bw),
+            coverage_tau=self._budget_tau(),
+            coverage_n_min=self._budget_floor(bw),
         )
+        for r in reqs:
+            self._note_live_width(
+                1, int(r.beam_width), int(r.live_width), "prefill_batch"
+            )
         n = len(reqs)
         all_rows = self.runner.alloc_req_slots(n * bw)
         all_rows_cpu = list(self.runner.req_pool.last_alloc_cpu)
@@ -1038,9 +1460,6 @@ class BeamRecEngine:
             req.expanded = True
             return
         limit = self.generation_token_limit(req.max_new_tokens)
-        logprobs, cand_ids = narrow_to_codebook_level(
-            logprobs, cand_ids, self._codebook_sizes(), level=0
-        )
         req.beam_list = init_from_prefill(
             logprobs,
             beam_width=req.beam_width,
@@ -1052,6 +1471,12 @@ class BeamRecEngine:
                 cand_ids if isinstance(cand_ids, torch.Tensor) else None
             ),
             temperature=req.temperature,
+            select_width=self._budget_select_width(int(req.beam_width)),
+            coverage_tau=self._budget_tau(),
+            coverage_n_min=self._budget_floor(int(req.beam_width)),
+        )
+        self._note_live_width(
+            1, int(req.beam_width), int(req.live_width), "prefill_single"
         )
         if limit <= 1:
             req.finished = True
@@ -1077,22 +1502,298 @@ class BeamRecEngine:
         logprobs: torch.Tensor,
         cand_ids: Optional[torch.Tensor],
     ) -> None:
-        per_cb = cand_ids is None and getattr(self.runner, "_per_codebook", False)
-        cb_sizes = None if per_cb else self._codebook_sizes()
+        per_cb = cand_ids is None and self.runner._per_codebook
         offset = 0
         for group in groups:
-            n_rows = sum(int(r.beam_width) for r in group)
+            n_rows = sum(int(r.live_width) for r in group)
             sl = logprobs[offset : offset + n_rows]
-            bl = group[0].beam_list if group else None
-            level = int(bl.generated_len()) if bl is not None else 0
             if per_cb:
+                level = (
+                    int(group[0].beam_list.generated_len())
+                    if group[0].beam_list is not None
+                    else 0
+                )
+                if self._try_sparse_expand(group, sl, level):
+                    offset += n_rows
+                    continue
                 lp, cids = self.runner.lm_head_level(sl, level)
+                self._expand_decode(group, lp, cids)
             else:
-                # Full restricted head fallback: narrow to the active codebook
-                # before top-k so wrong-level tokens cannot starve the pool.
-                lp, cids = narrow_to_codebook_level(sl, cand_ids, cb_sizes, level)
-            self._expand_decode(group, lp, cids)
+                self._expand_decode(group, sl, cand_ids)
             offset += n_rows
+
+    def _want_sparse(self, depth: Optional[int] = None) -> bool:
+        if not bool(getattr(self.config, "enable_sparse_lm_head", False)):
+            return False
+        vp = self.valid_path
+        if not vp.active or vp.mode != "trie":
+            return False
+        outdeg = (
+            int(getattr(vp, "_max_outdeg", 0) or 0)
+            if depth is None
+            else vp.max_outdeg_at_depth(int(depth))
+        )
+        if self._fused_sparse_score:
+            # The fused scorer reads weight rows in place, so wide out-degree
+            # costs bandwidth rather than an [rows, outdeg, H] tensor and the
+            # sparse_max_outdeg cap does not apply. Its plane is bounded by
+            # MAX_DEG, though: past that it would fall back to the reference
+            # gather, which is exactly what the cap exists to avoid.
+            return 0 < outdeg <= TRIE_BUDGET_MAX_DEG
+        cap = int(getattr(self.config, "sparse_max_outdeg", 256) or 256)
+        # A dense catalog is capped by construction; a CSR one is not, and
+        # ignoring the cap here is what made wide-out-degree catalogs take the
+        # [rows, outdeg, H] gather they were meant to skip.
+        return 0 < outdeg <= cap
+
+    def _budget_select_width(self, beam_width: int) -> int:
+        """First-level selection width. Always the full beam.
+
+        ``trie_budget_n0`` used to *cap* this at 64: n=128/512 beams kept only
+        64 first-level SIDs (the wave path without even a coverage check), so
+        the correct first code was often gone before decode began. n0 is now
+        the coverage floor (``_budget_floor``); the tau prefix decides where
+        between floor and beam_width the width actually lands.
+        """
+        return int(beam_width)
+
+    def _budget_floor(self, beam_width: int) -> int:
+        """Lower clamp for the coverage-tau prefix at any level.
+
+        With ``enable_trie_budget`` off this returns ``beam_width``, which
+        makes the clamp a no-op — that is what keeps the default path
+        bit-identical to the pre-86e5129-forced full-beam decode.
+        """
+        bw = max(int(beam_width), 1)
+        if not bool(getattr(self.config, "enable_trie_budget", False)):
+            return bw
+        n0 = int(getattr(self.config, "trie_budget_n0", 0) or 0)
+        n_min = int(getattr(self.config, "trie_budget_n_min", 16) or 16)
+        floor = max(n0, n_min) if n0 > 0 else max(n_min, 1)
+        return max(min(floor, bw), 1)
+
+    def _budget_tau(self) -> float:
+        if not bool(getattr(self.config, "enable_trie_budget", False)):
+            return 0.0
+        return float(getattr(self.config, "trie_budget_tau", 0.0) or 0.0)
+
+    def _note_live_width(
+        self, level: int, requested: int, live: int, site: str = "unknown"
+    ) -> None:
+        """Record survivors per SID depth for the trie-budget A/B.
+
+        The paper used "returned 192 of 200" for two different quantities —
+        rows the decode step actually drove at an intermediate depth, and
+        candidates the request finally returned. Only the second is a quality
+        number. Keeping them in separate fields here is what lets the A/B say
+        which one moved.
+        """
+        depth = max(int(level), 1)
+        bucket = self._beam_width_by_depth.get(depth)
+        if bucket is None:
+            bucket = self._beam_width_by_depth[depth] = {
+                "observations": 0,
+                "requested_sum": 0,
+                "live_sum": 0,
+                "pruned_sum": 0,
+                "live_min": 0,
+                "sites": {},
+            }
+        bucket["observations"] += 1
+        bucket["sites"][site] = bucket["sites"].get(site, 0) + 1
+        bucket["requested_sum"] += max(int(requested), 0)
+        bucket["live_sum"] += max(int(live), 0)
+        bucket["pruned_sum"] += max(int(requested) - int(live), 0)
+        if bucket["observations"] == 1:
+            bucket["live_min"] = max(int(live), 0)
+        elif int(live) < int(bucket["live_min"]):
+            bucket["live_min"] = max(int(live), 0)
+
+    def beam_width_by_depth(self) -> Dict[str, Dict[str, Any]]:
+        """Per-SID-depth requested/live/pruned widths. Snapshot for the A/B."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for depth, bucket in sorted(self._beam_width_by_depth.items()):
+            n = max(int(bucket["observations"]), 1)
+            out[str(depth)] = {
+                "observations": int(bucket["observations"]),
+                "requested_beam_mean": round(float(bucket["requested_sum"]) / n, 4),
+                "live_beam_mean": round(float(bucket["live_sum"]) / n, 4),
+                "pruned_mean": round(float(bucket["pruned_sum"]) / n, 4),
+                "live_beam_min": int(bucket["live_min"]),
+                "sites": dict(bucket["sites"]),
+            }
+        return out
+
+    def _try_sparse_expand(
+        self, reqs: List[BeamRequest], hidden: torch.Tensor, level: int
+    ) -> bool:
+        """Sparse-score + expand over legal trie neighbors."""
+        if not reqs:
+            return False
+        # ``level`` is generated_len, which is also the trie depth of every node
+        # in ``node_ids``, so the plane can be sized for this level's widest
+        # out-degree instead of the root's.
+        if not self._want_sparse(level):
+            return False
+        if not self.runner.lm_head.ready:
+            return False
+        # Validate the whole group before mutating any request so a mid-loop
+        # failure cannot leave half the group expanded and then fall through
+        # to a second dense ``_expand_decode``.
+        if any(r.beam_list is None or r.beam_list.node_ids is None for r in reqs):
+            return False
+        if self._tbb_expand_group(reqs, hidden, level):
+            return True
+        offset = 0
+        for req in reqs:
+            live = int(req.live_width)
+            h = hidden[offset : offset + live]
+            offset += live
+            nodes = req.beam_list.node_ids
+            scored = None
+            if self._fused_sparse_score:
+                w = self.runner.lm_head.restricted_weight
+                base = self.runner.lm_head.token_base
+                if w is not None and base is not None:
+                    scored = self.valid_path.score_neighbors(
+                        h, w, nodes, base, depth=level
+                    )
+            if scored is not None:
+                # Rows already come back sorted descending with the dead
+                # tail at -inf, so beam_candidates is a narrow(), not a
+                # topk, and nothing here reads a device tensor.
+                topk = min(int(req.beam_candidates), int(scored.logprobs.shape[1]))
+                vals = scored.logprobs[:, :topk]
+                tokens = scored.tokens[:, :topk]
+            else:
+                toks, _child, mask = self.valid_path.gather_neighbors(nodes)
+                lp = self.runner.lm_head.compute_sparse(h, toks, mask)
+                topk = min(req.beam_candidates, int(toks.shape[1]))
+                if int(toks.shape[1]) > topk:
+                    vals, idx = torch.topk(lp, topk, dim=1, largest=True, sorted=True)
+                    tokens = toks.gather(1, idx)
+                else:
+                    vals, idx = torch.sort(lp, dim=1, descending=True)
+                    tokens = toks.gather(1, idx)
+            limit = self.generation_token_limit(req.max_new_tokens)
+            remain = limit - int(req.beam_list.generated_len())
+            select_k = target_select_k(
+                int(req.beam_width),
+                int(req.beam_list.generated_len()),
+                remain,
+                int(getattr(self.config, "trie_budget_n0", 0) or 0),
+                int(getattr(self.config, "trie_budget_n_max", 0) or 0),
+            )
+            parents = expand_step(
+                req.beam_list,
+                tokens,
+                vals,
+                beam_width=select_k,
+                valid_path=self.valid_path,
+                stop_token_ids=req.stop_token_ids,
+                ignore_eos=req.ignore_eos,
+                will_finish=remain <= 1,
+                temperature=req.temperature,
+                skip_mask=True,
+            )
+            if parents is not None:
+                self._note_live_width(
+                    level, int(req.beam_width), int(parents.numel()), "per_request"
+                )
+            if remain <= 1 or parents is None:
+                req.finished = True
+                req.finish_reason = FinishReason(
+                    type="length", length=req.max_new_tokens
+                )
+            else:
+                self._remap_req(req, parents)
+        return True
+
+    def _tbb_expand_group(
+        self, reqs: List[BeamRequest], hidden: torch.Tensor, level: int
+    ) -> bool:
+        """Whole-group fused-sparse score + batched select/expand.
+
+        One ``score_neighbors`` launch over the concatenated frontier and one
+        batched ``expand_group_tbb`` replace the per-request kernel A +
+        ``expand_step`` chain (~10 launches per request per step). Requires
+        the lock-step invariants the fallback loop tolerates violating:
+        deterministic no-EOS decode and one live width / depth / table shape
+        across the group. Returns False untouched when they do not hold.
+        """
+        if not self._fused_sparse_score:
+            return False
+        w = self.runner.lm_head.restricted_weight
+        base = self.runner.lm_head.token_base
+        if w is None or base is None:
+            return False
+        first = reqs[0]
+        live = int(first.live_width)
+        bw = int(first.beam_width)
+        limit = self.generation_token_limit(first.max_new_tokens)
+        bl0 = first.beam_list
+        gen = int(bl0.generated_len())
+        remain = limit - gen
+        if remain <= 0 or bl0.token_ids is None or bl0.cum_logprobs is None:
+            return False
+        width = int(bl0.token_ids.shape[1])
+        for r in reqs:
+            bl = r.beam_list
+            if (
+                float(r.temperature) > 0.0
+                or (not r.ignore_eos and r.stop_token_ids)
+                or int(r.live_width) != live
+                or int(r.beam_width) != bw
+                or bl.token_ids is None
+                or bl.cum_logprobs is None
+                or int(bl.generated_len()) != gen
+                or int(bl.cur_len) != gen
+                or int(bl.token_ids.shape[0]) != live
+                or int(bl.token_ids.shape[1]) != width
+                or int(bl.cum_logprobs.numel()) != live
+                or int(bl.node_ids.numel()) != live
+                or self.generation_token_limit(r.max_new_tokens) != limit
+            ):
+                return False
+        nodes_cat = torch.cat([r.beam_list.node_ids.reshape(-1) for r in reqs])
+        scored = self.valid_path.score_neighbors(
+            hidden, w, nodes_cat, base, depth=level
+        )
+        if scored is None:
+            return False
+        select_k = target_select_k(
+            bw,
+            gen,
+            remain,
+            int(getattr(self.config, "trie_budget_n0", 0) or 0),
+            int(getattr(self.config, "trie_budget_n_max", 0) or 0),
+        )
+        # Per-step coverage budget (the "budget" in TBB): shrink the surviving
+        # width to the ranked prefix holding tau of the reachable leaf mass.
+        # Skipped on the final expand, which must fill the full beam.
+        tau = self._budget_tau() if remain > 1 else 0.0
+        leaf_count = self.valid_path._leaf_count if tau > 0.0 else None
+        parents = expand_group_tbb(
+            [r.beam_list for r in reqs],
+            scored,
+            live=live,
+            select_k=select_k,
+            tau=tau,
+            n_min=self._budget_floor(bw),
+            leaf_count=leaf_count,
+        )
+        if parents is None:
+            return False
+        for req, par in zip(reqs, parents):
+            self._note_live_width(level, int(req.beam_width), len(par), "tbb_group")
+            if remain <= 1:
+                req.finished = True
+                req.finish_reason = FinishReason(
+                    type="length", length=req.max_new_tokens
+                )
+            else:
+                self._remap_req(req, par)
+        return True
 
     def _ordered_live(
         self, reqs: List[BeamRequest]
@@ -1100,7 +1801,7 @@ class BeamRecEngine:
         live = [r for r in reqs if not r.finished]
         groups = group_by_beam_depth(
             live,
-            lambda r: int(r.beam_width),
+            lambda r: int(r.live_width),
             lambda r: (
                 int(r.beam_list.generated_len()) if r.beam_list is not None else 0
             ),
@@ -1110,7 +1811,11 @@ class BeamRecEngine:
 
     def _decode_tick(self, reqs: List[BeamRequest]) -> None:
         """One scheduler tick: process prior pipe result, launch one pipe (or serial)."""
-        live = [r for r in reqs if not r.finished]
+        # token_ids are inference tensors created under inference_mode in the
+        # decode forward; the unary/leaf finish writes them in place, so it must
+        # run in inference mode too (otherwise RuntimeError on every request).
+        with torch.inference_mode():
+            live = self._unary_finish_live([r for r in reqs if not r.finished])
         if not live:
             return
         pipe = self.pipeline
@@ -1140,13 +1845,118 @@ class BeamRecEngine:
             # launched the full conc=8 / 400-row batch and killed 3-pipe overlap.
             return
         launch = self._launch_pipe_forward(batch, pipe.current_pipe_id)
+        if launch is None:
+            return
         pipe.enqueue(pipe.current_pipe_id, launch)
+
+    def _unary_finish_live(self, reqs: List[BeamRequest]) -> List[BeamRequest]:
+        """Finish trailing-unary / small-leaf requests. Return those that still need decode.
+
+        Both gates (forced-unary suffix, leaf flush) are evaluated for every
+        request in one batched reduction and one DtoH sync per tick. The
+        per-request form cost up to ``2 * remain + 1`` ``.item()`` stalls per
+        request per step even when neither gate ever fired.
+        """
+        enabled = bool(getattr(self.config, "enable_unary_finish", True))
+        flush_leaves = int(getattr(self.config, "trie_flush_leaves", 0) or 0)
+        vp = self.valid_path
+        trie_ok = vp is not None and vp.active and vp.mode == "trie"
+        use_leaf = flush_leaves > 0 and trie_ok
+        use_unary = enabled and trie_ok
+
+        gates: dict = {}
+        cand: List[Tuple[BeamRequest, torch.Tensor, int]] = []
+        if use_unary or use_leaf:
+            for req in reqs:
+                if req.finished:
+                    continue
+                if float(getattr(req, "temperature", 0.0) or 0.0) > 0.0:
+                    continue
+                bl = getattr(req, "beam_list", None)
+                if bl is None or bl.node_ids is None or bl.token_ids is None:
+                    continue
+                if int(bl.node_ids.numel()) == 0:
+                    # Vacuous all() would pass the gates; can_unary_finish
+                    # treats an empty frontier as not finishable.
+                    continue
+                remain = self.generation_token_limit(req.max_new_tokens) - int(
+                    bl.generated_len()
+                )
+                cand.append((req, bl.node_ids, remain))
+        if cand:
+            device = cand[0][1].device
+            sfx = None
+            lc_t = None
+            if vp.ensure_unary_tables(device):
+                sfx = getattr(vp, "_unary_suffix_len", None) if use_unary else None
+                lc_t = vp._leaf_count if use_leaf else None
+            if sfx is not None or lc_t is not None:
+                sizes = torch.tensor(
+                    [int(nodes.numel()) for _, nodes, _ in cand], dtype=torch.int64
+                ).to(device)
+                flat = torch.cat([nodes.reshape(-1) for _, nodes, _ in cand]).to(
+                    dtype=torch.int64
+                )
+                n_nodes = int(vp._outdeg.shape[0])
+                valid = (flat >= 0) & (flat < n_nodes)
+                safe = flat.clamp(0, max(n_nodes - 1, 0))
+                req_idx = torch.repeat_interleave(
+                    torch.arange(len(cand), device=device), sizes
+                )
+                flags = []
+                if sfx is not None:
+                    remains = torch.tensor(
+                        [max(int(r), 0) for _, _, r in cand], dtype=torch.int32
+                    ).to(device)[req_idx]
+                    unary_row = valid & (sfx.to(device=device)[safe] >= remains)
+                    flags.append(unary_row)
+                if lc_t is not None:
+                    leaf_row = valid & (lc_t.to(device=device)[safe] <= flush_leaves)
+                    flags.append(leaf_row)
+                acc = torch.ones(
+                    (len(flags), len(cand)), dtype=torch.int8, device=device
+                )
+                for j, row in enumerate(flags):
+                    acc[j].scatter_reduce_(
+                        0, req_idx, row.to(dtype=torch.int8), reduce="amin"
+                    )
+                acc_cpu = acc.cpu().tolist()
+                j = 0
+                unary_ok = acc_cpu[j] if sfx is not None else None
+                if sfx is not None:
+                    j += 1
+                leaf_ok = acc_cpu[j] if lc_t is not None else None
+                for i, (req, _, remain) in enumerate(cand):
+                    u_ok = unary_ok is not None and bool(unary_ok[i]) and remain > 0
+                    l_ok = leaf_ok is not None and bool(leaf_ok[i])
+                    gates[id(req)] = (u_ok, l_ok)
+
+        leftover: List[BeamRequest] = []
+        for req in reqs:
+            if req.finished:
+                continue
+            limit = self.generation_token_limit(req.max_new_tokens)
+            g = gates.get(id(req))
+            if enabled and try_unary_finish_request(
+                req, self.valid_path, limit, gate=(g[0] if g is not None else None)
+            ):
+                continue
+            if use_leaf and g is not None and g[1]:
+                # try_leaf_flush re-checks the gate (one sync) but only runs on
+                # the rare firing path; the steady-state cost is the batch above.
+                if try_leaf_flush(req, self.valid_path, limit, flush_leaves):
+                    continue
+            leftover.append(req)
+        return leftover
 
     def _launch_pipe_forward(
         self, reqs: List[BeamRequest], pipe_id: Optional[int]
-    ) -> _DecodeLaunch:
+    ) -> Optional[_DecodeLaunch]:
         self._wait_pipe_ready(pipe_id, pop=True)
-        ordered, _ = self._ordered_live(reqs)
+        live = self._unary_finish_live([r for r in reqs if not r.finished])
+        if not live:
+            return None
+        ordered, _ = self._ordered_live(live)
         for req in ordered:
             ev = getattr(req, "prefill_done", None)
             if ev is not None:
@@ -1168,6 +1978,18 @@ class BeamRecEngine:
         )
 
     def _run_expand_overlap(
+        self,
+        apply_fn: Callable[[], None],
+        replay_done: Optional[torch.cuda.Event],
+        pipe_id: Optional[int],
+    ) -> None:
+        t0 = time.perf_counter()
+        try:
+            self._run_expand_overlap_impl(apply_fn, replay_done, pipe_id)
+        finally:
+            self.path_stats["expand_s"] += time.perf_counter() - t0
+
+    def _run_expand_overlap_impl(
         self,
         apply_fn: Callable[[], None],
         replay_done: Optional[torch.cuda.Event],
@@ -1223,9 +2045,14 @@ class BeamRecEngine:
             if launch.fused is not None:
                 self._apply_fused(launch.reqs, launch.fused)
                 return
+            # Regroup with the same key _ordered_live used to lay out the
+            # forward rows (live_width, generated_len). Keying on beam_width
+            # merges requests whose live rows are not contiguous in
+            # ``launch.logprobs``, and the per-group offset then reads
+            # another request's rows.
             groups = group_by_beam_depth(
                 launch.reqs,
-                lambda r: int(r.beam_width),
+                lambda r: int(r.live_width),
                 lambda r: (
                     int(r.beam_list.generated_len()) if r.beam_list is not None else 0
                 ),
@@ -1236,7 +2063,7 @@ class BeamRecEngine:
 
     def _decode_one_step(self, reqs: List[BeamRequest]) -> None:
         """Serial decode: one forward over all live reqs (conc=1 / pipeline off)."""
-        live = [r for r in reqs if not r.finished]
+        live = self._unary_finish_live([r for r in reqs if not r.finished])
         if not live:
             return
         ordered, groups = self._ordered_live(live)
@@ -1260,10 +2087,17 @@ class BeamRecEngine:
 
     def _forward_decode(self, reqs: List[BeamRequest]):
         device = self.device
-        tok_srcs = [
-            req.beam_list.last_tokens.to(device=device, dtype=torch.int64)
-            for req in reqs
-        ]
+        # Trim tok_srcs to live_width to match the rows we drive. last_tokens
+        # may be allocated at beam_width (e.g. right after prefill, before
+        # _budget_prune has run), but decode only sees live_width rows.
+        tok_srcs: List[torch.Tensor] = []
+        for req in reqs:
+            tok = req.beam_list.last_tokens.to(device=device, dtype=torch.int64)
+            lw = int(req.live_width)
+            if lw > 0 and tok.shape[0] != lw:
+                tok_srcs.append(tok[:lw])
+            else:
+                tok_srcs.append(tok)
         # Wave cache: pool_rows persists across decode steps within the same wave.
         # _wave_seq_base holds seq_len at wave start; step counter gives O(1)
         # position/seq_lens computation without rebuilding Python lists or H2D.
@@ -1271,7 +2105,15 @@ class BeamRecEngine:
         # id() can reappear on a new one and make it inherit the previous wave's
         # _wave_step/_wave_seq_base -- decode then starts mid-sequence.
         reqs_key = tuple(r.rid for r in reqs)
-        wave_hit = self._wave_reqs_key == reqs_key and self._wave_pool_rows is not None
+        live_key = tuple(int(r.live_width) for r in reqs)
+        # Invalidate the wave row cache when live_width changes between
+        # steps — otherwise n_rows stays at the previous width and staging
+        # copy_rows blows up.
+        wave_hit = (
+            self._wave_reqs_key == reqs_key
+            and self._wave_pool_rows is not None
+            and getattr(self, "_wave_live_key", None) == live_key
+        )
         if wave_hit:
             pool_rows = self._wave_pool_rows
             n_rows = self._wave_n_rows
@@ -1279,26 +2121,43 @@ class BeamRecEngine:
         else:
             row_srcs = [req.beam_pool_indices.to(device=device) for req in reqs]
             n_rows = int(sum(int(t.numel()) for t in tok_srcs))
-            pool_rows = self._stage.copy_rows("dec_rows", row_srcs, device, torch.int64)
+            # Use live_width (=last_tokens.shape[0]) rather than beam_width.
+            # beam_pool_indices is allocated at the requested width and can be
+            # longer than the rows decode actually drives. Truncate each
+            # request's pool rows to its live_width and rebuild seq_base so the
+            # wave cache matches the rows we drive.
+            trimmed: List[torch.Tensor] = []
+            for r, rows in zip(reqs, row_srcs):
+                lw = int(r.live_width)
+                if rows.shape[0] != lw:
+                    trimmed.append(rows[:lw])
+                else:
+                    trimmed.append(rows)
+            pool_rows = self._stage.copy_rows("dec_rows", trimmed, device, torch.int64)
             seq_base: List[int] = []
             for req in reqs:
-                seq_base.extend([int(req.seq_len)] * int(req.beam_width))
-            seq_base_gpu, seq_base_cpu = self._stage.copy_list(
+                seq_base.extend([int(req.seq_len)] * int(req.live_width))
+            seq_base_gpu, _ = self._stage.copy_list(
                 "_wave_base", seq_base, device, torch.int64
             )
             self._wave_pool_rows = pool_rows
             self._wave_seq_base = seq_base_gpu
-            self._wave_seq_base_cpu = seq_base_cpu
             self._wave_seq_base_sum = int(sum(seq_base))
             self._wave_reqs_key = reqs_key
+            self._wave_live_key = live_key
             self._wave_n_rows = n_rows
             self._wave_step = 0
             # Reused every decode step of the wave; rebuilding an n_rows-long
             # Python list per step is pure interpreter churn.
             self._wave_ones = [1] * n_rows
+            self._wave_cascade_l0 = None
+            self._wave_cascade_l1 = None
         step = self._wave_step
         pack = bool(getattr(self.config, "enable_decode_pack", True))
-        if not pack:
+        if pack:
+            self.path_stats["decode_token_pack_batches"] += 1
+        else:
+            self.path_stats["decode_token_cat_batches"] += 1
             last_tokens = torch.cat(tok_srcs)
         out_cache = self.runner.alloc_tokens(n_rows)
         out_cache_cpu = self.runner.kv_pool.last_alloc_cpu
@@ -1310,19 +2169,64 @@ class BeamRecEngine:
         ).view(-1)
         offset = 0
         for req in reqs:
-            bw = int(req.beam_width)
+            lw = int(req.live_width)
             req.beam_list.record_owned_decode_kv_cpu(
-                out_cache_cpu[offset : offset + bw]
+                out_cache_cpu[offset : offset + lw]
             )
-            offset += bw
+            offset += lw
         for req in reqs:
             req.seq_len += 1
         graph = self.runner.graph
+        # Per-level graphs bake the codebook logits + expand into one capture
+        # and do not take a CascadeMeta, so _try_level_forward ignores anything
+        # built below. Try it first: with --enable-cascade-attention on, packing
+        # the static buffers and building the cascade index tables (a CPU
+        # index_select + cat over req_to_token, every step) was pure waste and
+        # cost 3.2x on p50 at beam=1000.
+        level_t0 = time.perf_counter()
+        with torch.inference_mode():
+            with trace_range(f"flashrec.decode_fwd reqs={len(reqs)}"):
+                level_result = self._try_level_forward(
+                    reqs,
+                    n_rows,
+                    pool_rows,
+                    out_cache,
+                    step,
+                    pack,
+                    tok_srcs,
+                )
+                if level_result is not None:
+                    self._account_decode(
+                        n_rows,
+                        len(reqs),
+                        kind="level_graph",
+                        cascade=False,
+                        expand_graph=bool(
+                            self.config.enable_graph_expand
+                            and self.config.enable_fused_expand
+                        ),
+                        elapsed=time.perf_counter() - level_t0,
+                    )
+                    return level_result
+        # Cascade decode reads each request's prompt KV once per step instead
+        # of once per beam row. When a cascade CUDA graph was captured for this
+        # padded batch size (and the request count fits the dummy slot), pack
+        # into the static buffers and replay that graph; otherwise eager cascade.
+        cascade_on = (
+            bool(getattr(self.config, "enable_cascade_attention", False))
+            and n_rows >= int(getattr(self.config, "cascade_min_rows", 128))
+            and bool(getattr(self.runner.attn, "supports_cascade", False))
+        )
+        graph_ok = graph is not None and graph.can_replay(n_rows)
+        cascade_graph = (
+            cascade_on and graph_ok and graph.can_replay_cascade(n_rows, len(reqs))
+        )
         packed = (
             graph.buffers_for(n_rows)
-            if graph is not None and graph.can_replay(n_rows)
+            if graph_ok and (not cascade_on or cascade_graph)
             else None
         )
+        want_expand = False
         with torch.inference_mode():
             if packed is not None:
                 _, buf = packed
@@ -1346,12 +2250,8 @@ class BeamRecEngine:
                 torch.add(
                     self._wave_seq_base[:raw], step + 1, out=buf["seq_lens"][:raw]
                 )
-                # CPU seq_lens for FlashInfer plan must not D2H the GPU write:
-                # plan() reads host_indptr immediately, and a stale copy after a
-                # prompt-len change collapses CUDA-graph decode.
-                assert self._wave_seq_base_cpu is not None
-                fill_cpu_seq_lens(
-                    buf["seq_lens_cpu"][:raw], self._wave_seq_base_cpu[:raw], step
+                buf["seq_lens_cpu"][:raw].copy_(
+                    buf["seq_lens"][:raw], non_blocking=True
                 )
                 seq_after_total = self._wave_seq_base_sum + raw * (step + 1)
                 with trace_range(f"flashrec.gather_kv rows={raw}"):
@@ -1362,8 +2262,11 @@ class BeamRecEngine:
                         total=seq_after_total,
                     )
                 want_expand = self._can_graph_expand(reqs, n_rows)
+                if cascade_on and want_expand:
+                    want_expand = graph.can_replay_cascade_expand(n_rows)
                 if want_expand:
                     self._pack_graph_expand(reqs, buf)
+                cascade = self._build_cascade_meta(reqs, n_rows) if cascade_on else None
                 batch = ForwardBatch(
                     input_ids=buf["input_ids"][:raw],
                     req_pool_indices=buf["req_pool"][:raw],
@@ -1377,6 +2280,7 @@ class BeamRecEngine:
                     kv_indices=kv_indices,
                     buffers_ready=True,
                     want_expand=want_expand,
+                    cascade=cascade,
                 )
             else:
                 if pack:
@@ -1390,6 +2294,7 @@ class BeamRecEngine:
                     kv_indices = self.runner.gather_kv_indices(
                         pool_rows, seq_gpu, total=seq_after_total
                     )
+                cascade = self._build_cascade_meta(reqs, n_rows) if cascade_on else None
                 batch = ForwardBatch(
                     input_ids=last_tokens,
                     req_pool_indices=pool_rows,
@@ -1401,9 +2306,280 @@ class BeamRecEngine:
                     extend_prefix_lens=None,
                     extend_seq_lens=self._wave_ones,
                     kv_indices=kv_indices,
+                    cascade=cascade,
                 )
+            kind = "graph" if packed is not None else "eager"
+            expand_graph = bool(packed is not None and want_expand)
+            t0 = time.perf_counter()
             with trace_range(f"flashrec.decode_fwd reqs={len(reqs)}"):
-                return self.runner.forward(batch)
+                decoded = self.runner.forward(batch)
+            self._account_decode(
+                n_rows,
+                len(reqs),
+                kind=kind,
+                cascade=cascade is not None,
+                expand_graph=expand_graph,
+                elapsed=time.perf_counter() - t0,
+            )
+            return decoded
+
+    def _try_level_forward(
+        self,
+        reqs: List[BeamRequest],
+        n_rows: int,
+        pool_rows: torch.Tensor,
+        out_cache: torch.Tensor,
+        step: int,
+        pack: bool,
+        tok_srcs: List[torch.Tensor],
+    ):
+        """Try per-level CUDA graph (model_fwd + lm_head + expand).
+
+        Returns ``(logprobs, cand_ids, fused)`` on success, or ``None`` to
+        fall through to the base forward path.
+        """
+        if not bool(getattr(self.config, "enable_level_graph", True)):
+            return None
+        graph = self.runner.graph
+        if graph is None or not graph.level_specs:
+            return None
+        if not reqs:
+            return None
+        bw = int(self.config.beam_width)
+        if bw <= 0 or n_rows % bw != 0:
+            return None
+        if len(reqs) != n_rows // bw:
+            return None
+        depths = set()
+        for req in reqs:
+            if int(req.beam_width) != bw:
+                return None
+            if not req.ignore_eos or req.temperature > 0.0:
+                return None
+            bl = req.beam_list
+            if bl is None or bl.node_ids is None or bl.token_ids is None:
+                return None
+            if bl.cum_logprobs is None:
+                return None
+            depths.add(int(bl.generated_len()))
+        if len(depths) != 1:
+            return None
+        level = depths.pop()
+        if not graph.can_replay_level(n_rows, level):
+            return None
+        bs = graph.pad_bs(n_rows)
+        key = (bs, level)
+        buf = graph.static_level.get(key)
+        if buf is None:
+            return None
+        lspec = graph.level_specs[level]
+        width = int(lspec.expand_spec.width)
+        for req in reqs:
+            bl = req.beam_list
+            if int(bl.token_ids.shape[0]) != bw or int(bl.token_ids.shape[-1]) != width:
+                return None
+
+        device = self.device
+        raw = n_rows
+        if pack:
+            self._stage.copy_rows(
+                "dec_tok_lv",
+                tok_srcs,
+                device,
+                torch.int64,
+                dest=buf["input_ids"][:raw],
+            )
+        else:
+            last_tokens = torch.cat(tok_srcs)
+            buf["input_ids"][:raw].copy_(last_tokens.view(-1)[:raw], non_blocking=True)
+        buf["req_pool"][:raw].copy_(pool_rows[:raw], non_blocking=True)
+        buf["out_loc"][:raw].copy_(out_cache.view(-1)[:raw], non_blocking=True)
+        torch.add(self._wave_seq_base[:raw], step, out=buf["positions"][:raw])
+        torch.add(self._wave_seq_base[:raw], step + 1, out=buf["seq_lens"][:raw])
+        buf["seq_lens_cpu"][:raw].copy_(buf["seq_lens"][:raw], non_blocking=True)
+        seq_after_total = self._wave_seq_base_sum + raw * (step + 1)
+        with trace_range(f"flashrec.gather_kv_lv rows={raw}"):
+            kv_indices = self.runner.gather_kv_indices(
+                pool_rows,
+                buf["seq_lens"][:raw],
+                out=buf["kv_indices"],
+                total=seq_after_total,
+            )
+        self._pack_level_expand(reqs, buf, level)
+        batch = ForwardBatch(
+            input_ids=buf["input_ids"][:raw],
+            req_pool_indices=buf["req_pool"][:raw],
+            seq_lens=buf["seq_lens"][:raw],
+            seq_lens_cpu=buf["seq_lens_cpu"][:raw],
+            positions=buf["positions"][:raw],
+            out_cache_loc=buf["out_loc"][:raw],
+            is_prefill=False,
+            extend_prefix_lens=None,
+            extend_seq_lens=self._wave_ones,
+            kv_indices=kv_indices,
+            buffers_ready=True,
+            codebook_level=level,
+        )
+        return self.runner.forward(batch)
+
+    def _pack_level_expand(
+        self, reqs: List[BeamRequest], buf: dict, level: int
+    ) -> None:
+        """Pack expand buffers for per-level graph with node ID remapping."""
+        with trace_range(f"flashrec.pack_level_expand reqs={len(reqs)} level={level}"):
+            n = len(reqs)
+            n_pad = int(buf["exp_n"])
+            device = self.device
+            graph = self.runner.graph
+            torch.stack(
+                [
+                    r.beam_list.cum_logprobs.to(device=device, dtype=torch.float32)
+                    for r in reqs
+                ],
+                out=buf["exp_cum"][:n],
+            )
+            if graph is not None:
+                tok_src, tok_dst, node_src, node_dst = graph.expand_io(buf, n)
+            else:
+                tok_src, tok_dst = buf["exp_tok_in"][:n], buf["exp_tok_out"]
+                node_src, node_dst = buf["exp_nodes"][:n], buf["exp_node_out"]
+            self._detach_plane_aliases(tok_dst, reqs, "token_ids")
+            self._detach_plane_aliases(node_dst, reqs, "node_ids")
+            tok_rows = [
+                r.beam_list.token_ids.to(device=device, dtype=torch.int64) for r in reqs
+            ]
+            if not rows_alias_stack(tok_rows, tok_src):
+                torch.stack(tok_rows, out=tok_src)
+            node_rows = [
+                r.beam_list.node_ids.to(device=device, dtype=torch.int64) for r in reqs
+            ]
+            offset = 0
+            if self._level_node_offsets and level < len(self._level_node_offsets):
+                offset = int(self._level_node_offsets[level])
+            # Local-id remap is in-place on node_src. If that plane is a live
+            # stolen view, subtract would corrupt global node ids held by
+            # beam_list; clone the live rows off the graph plane first.
+            if offset != 0 and rows_alias_stack(node_rows, node_src):
+                for req in reqs:
+                    bl = req.beam_list
+                    if bl is not None and bl.node_ids is not None:
+                        bl.node_ids = bl.node_ids.clone()
+                node_rows = [
+                    r.beam_list.node_ids.to(device=device, dtype=torch.int64)
+                    for r in reqs
+                ]
+            if not rows_alias_stack(node_rows, node_src):
+                torch.stack(node_rows, out=node_src)
+            if offset != 0:
+                valid = node_src[:n] >= 0
+                node_src[:n] = torch.where(valid, node_src[:n] - offset, node_src[:n])
+            cols = [int(r.beam_list.cur_len) for r in reqs]
+            self._stage.copy_list(
+                "exp_col_lv", cols, device, torch.int32, dest=buf["exp_col"][:n]
+            )
+            buf["exp_do"][:n].fill_(1)
+            if n_pad > n:
+                buf["exp_do"][n:n_pad].zero_()
+                buf["exp_col"][n:n_pad].zero_()
+
+    def _build_cascade_meta(
+        self, reqs: List[BeamRequest], n_rows: int
+    ) -> Optional[CascadeMeta]:
+        """Index tables for two-level cascade decode (see ``CascadeMeta``).
+
+        Level 0 (shared prompt pages, identical across a request's beam rows
+        after ``copy_prefill_to_beams``) is keyed on ``prompt_len`` — not the
+        wave-start seq_len, which after a mid-wave rebuild (narrowing) already
+        counts decode steps whose pages are per-beam, not shared. indptr
+        arrays live on CPU (plan is host work); indices stay on GPU.
+
+        Level-1 qo_indptr / last_page_len are constant for a wave (n_rows
+        fixed). kv_indptr is ``arange * dec_len`` when every row shares the
+        same decode depth (lockstep). Prompt-homogeneous waves gather L1
+        pages in one ``index_select``.
+        """
+        table = self.runner.req_pool.req_to_token
+        l0 = self._wave_cascade_l0
+        if l0 is None:
+            qo0 = [0]
+            kv0 = [0]
+            idx0: List[torch.Tensor] = []
+            for req in reqs:
+                rows_cpu = req.beam_pool_indices_cpu
+                if not rows_cpu:
+                    return None
+                pl = int(req.prompt_len)
+                if pl <= 0:
+                    return None
+                # live_width, not the allocated beam_width. Trie-budget and
+                # sparse top-k shrink the driven rows before the first decode
+                # step; L1 is sized to that live count, and a stale L0 width
+                # makes the cascade CUDA-graph plan reject the batch.
+                qo0.append(qo0[-1] + int(req.live_width))
+                kv0.append(kv0[-1] + pl)
+                idx0.append(table[int(rows_cpu[0]), :pl])
+            l0 = (
+                torch.tensor(qo0, dtype=torch.int32),
+                torch.tensor(kv0, dtype=torch.int32),
+                torch.cat(idx0).contiguous() if len(idx0) > 1 else idx0[0].contiguous(),
+                torch.ones(len(reqs), dtype=torch.int32),
+            )
+            self._wave_cascade_l0 = l0
+        qo0_t, kv0_t, idx0_t, last0 = l0
+        prompt_lens = [int(r.prompt_len) for r in reqs]
+        dec_lens = [int(r.seq_len) - int(r.prompt_len) for r in reqs]
+        if any(d <= 0 or r.beam_pool_indices is None for d, r in zip(dec_lens, reqs)):
+            return None
+        l1 = self._wave_cascade_l1
+        if l1 is None or int(l1[0].numel()) != n_rows + 1:
+            l1 = (
+                torch.arange(n_rows + 1, dtype=torch.int32),
+                torch.ones(n_rows, dtype=torch.int32),
+            )
+            self._wave_cascade_l1 = l1
+        qo1_t, last1 = l1
+        same_dec = len(set(dec_lens)) == 1
+        if same_dec:
+            kv1_t = qo1_t * int(dec_lens[0])
+        else:
+            kv1 = [0]
+            for req, d in zip(reqs, dec_lens):
+                base = kv1[-1]
+                kv1.extend(base + d * (i + 1) for i in range(int(req.live_width)))
+            kv1_t = torch.tensor(kv1, dtype=torch.int32)
+        same_prompt = len(set(prompt_lens)) == 1
+        pool = self._wave_pool_rows
+        if (
+            same_dec
+            and same_prompt
+            and pool is not None
+            and int(pool.numel()) >= n_rows
+        ):
+            pl = int(prompt_lens[0])
+            d = int(dec_lens[0])
+            rows = pool.view(-1)[:n_rows]
+            if rows.dtype != torch.int64:
+                rows = rows.to(dtype=torch.int64)
+            idx1 = table.narrow(1, pl, d).index_select(0, rows).reshape(-1)
+        else:
+            idx1_parts: List[torch.Tensor] = []
+            for req, pl, d in zip(reqs, prompt_lens, dec_lens):
+                rows = req.beam_pool_indices.view(-1)
+                lw = int(req.live_width)
+                if int(rows.shape[0]) != lw:
+                    rows = rows[:lw]
+                if rows.dtype != torch.int64:
+                    rows = rows.to(dtype=torch.int64)
+                idx1_parts.append(
+                    table.narrow(1, pl, d).index_select(0, rows).reshape(-1)
+                )
+            idx1 = torch.cat(idx1_parts) if len(idx1_parts) > 1 else idx1_parts[0]
+        return CascadeMeta(
+            qo_indptr=[qo0_t, qo1_t],
+            kv_indptr=[kv0_t, kv1_t],
+            kv_indices=[idx0_t, idx1],
+            last_page_len=[last0, last1],
+        )
 
     def _expand_decode(
         self,
@@ -1427,7 +2603,13 @@ class BeamRecEngine:
             and self.valid_path.mode == "trie"
             # Fused kernels need the dense allow/next tables; large (CSR-only)
             # tries take the eager per-request path below.
-            and self.valid_path._allow_table is not None
+            and (
+                self.valid_path._allow_table is not None
+                or (
+                    self.valid_path._csr_rowptr is not None
+                    and self.device.type == "cuda"
+                )
+            )
             and all(r.ignore_eos for r in reqs)
             # Fused CUDA select has no Gumbel-noise hook; sampled requests take
             # the eager per-request path below.
@@ -1436,12 +2618,17 @@ class BeamRecEngine:
         if use_fused and len(reqs) >= 1:
             try:
                 self._expand_fused(reqs, logprobs, cand_ids)
+                self.path_stats["fused_expand_batches"] += 1
                 return
             except Exception:
+                self.path_stats["fused_expand_fallback_batches"] += 1
                 logger.debug("fused expand fallback", exc_info=True)
+        self.path_stats["eager_expand_batches"] += 1
         for req in reqs:
             bw = int(req.beam_width)
-            topk = min(req.beam_candidates, int(logprobs.shape[1]))
+            topk = trie_candidate_width(
+                req.beam_width, int(logprobs.shape[1]), self.valid_path.active
+            )
             row = logprobs[offset : offset + bw]
             # Temperature rescaling must see the full row (renormalization is
             # only exact over the whole candidate vocabulary), so it happens
@@ -1473,7 +2660,7 @@ class BeamRecEngine:
     ) -> None:
         n = len(reqs)
         bw = int(reqs[0].beam_width)
-        topk = min(reqs[0].beam_candidates, int(logprobs.shape[1]))
+        topk = trie_candidate_width(bw, int(logprobs.shape[1]), self.valid_path.active)
         stacked = logprobs.view(n, bw, -1)
         if stacked.shape[-1] > topk:
             vals, idx = torch.topk(stacked, topk, dim=-1, largest=True, sorted=True)
@@ -1514,8 +2701,6 @@ class BeamRecEngine:
         # Pinned staging: torch.tensor(list, device=cuda) is a pageable H2D
         # that stalls the host behind the in-flight forward on the expand
         # stream (the graph path already stages "exp_col" the same way).
-        # PinnedStage ping-pongs pins so a later fill cannot corrupt an
-        # in-flight non_blocking H2D (that bug wrote SID column 1 as 0).
         if self.device.type == "cuda":
             col_t, _ = self._stage.copy_list(
                 "exp_col_eager", cols, self.device, torch.int32
@@ -1526,24 +2711,65 @@ class BeamRecEngine:
         will_finish = [
             r.beam_list.generated_len() + 1 >= lim for r, lim in zip(reqs, limits)
         ]
-        fused = genrec_mask_topk_expand(
-            cum,
-            vals.to(dtype=torch.float32),
-            tokens.to(dtype=torch.int64),
-            select_k=bw,
-            node_ids=node_ids,
-            allow_table=self.valid_path._allow_table,
-            token_base=int(self.valid_path.token_base or 0),
-            token_ids=token_ids,
-            col=col_t,
-            next_node=self.valid_path._next_node,
-            invalid_node=int(self.valid_path._invalid_node),
-            apply_mask=True,
-            apply_expand=True,
-            apply_advance=node_ids is not None,
-            inplace=False,
-            workspace=ws,
-        )
+        if self.valid_path._csr_rowptr is not None:
+            from flashrec.kernel.csr_trie import run
+
+            def buf(name, shape, dtype):
+                return ws.get("csr_" + name, shape, dtype, self.device)
+
+            out_vals = buf("values", (n, bw), torch.float32)
+            out_parents = buf("parents", (n, bw), torch.int64)
+            out_tokens = buf("tokens", (n, bw), torch.int64)
+            out_indices = buf("indices", (n, bw), torch.int64)
+            tok_out = buf("history", (n, bw, width), torch.int64)
+            node_out = buf("nodes", (n, bw), torch.int64)
+            run(
+                self.valid_path._csr_rowptr,
+                self.valid_path._csr_columns,
+                self.valid_path._csr_child,
+                int(self.valid_path._invalid_node),
+                buf("scores", (n, bw * topk), torch.float32),
+                cum,
+                vals,
+                tokens,
+                node_ids,
+                token_ids,
+                col_t,
+                ws.get_filled("csr_expand", (n,), torch.uint8, self.device, 1),
+                out_vals,
+                out_parents,
+                out_tokens,
+                out_indices,
+                tok_out,
+                node_out,
+            )
+            fused = GenrecFusedResult(
+                out_vals,
+                out_parents.clone(),
+                out_tokens.clone(),
+                out_indices.clone(),
+                tok_out.clone(),
+                node_out.clone(),
+            )
+        else:
+            fused = genrec_mask_topk_expand(
+                cum,
+                vals.to(dtype=torch.float32),
+                tokens.to(dtype=torch.int64),
+                select_k=bw,
+                node_ids=node_ids,
+                allow_table=self.valid_path._allow_table,
+                token_base=int(self.valid_path.token_base or 0),
+                token_ids=token_ids,
+                col=col_t,
+                next_node=self.valid_path._next_node,
+                invalid_node=int(self.valid_path._invalid_node),
+                apply_mask=True,
+                apply_expand=True,
+                apply_advance=node_ids is not None,
+                inplace=False,
+                workspace=ws,
+            )
         # One plane clone instead of n per-request clones; rows of the clone
         # are as safe to hold across steps as individual clones were.
         vals_owned = fused.vals[:n].clone()
@@ -1595,10 +2821,15 @@ class BeamRecEngine:
         if self._defer_remap:
             self._pending_remaps.append((req, parents_rel))
             return
-        bw = int(req.beam_width)
-        n_owned = req.beam_list.owned_decode_kv_count()
-        n_decode = int(n_owned) // max(bw, 1) if n_owned > 0 else 0
-        seq_len = int(req.prompt_len) + max(n_decode, 0)
+        if req.beam_pool_indices is None:
+            return
+        # Decode pages already on the rows: one per generated token before the
+        # token just appended by expand_step. Do not divide owned KV by
+        # beam_width — live_width can be shorter than beam_width, which made
+        # n_decode collapse to 0 and skipped the gather.
+        bl = req.beam_list
+        n_decode = max(int(bl.generated_len()) - 1, 0) if bl is not None else 0
+        seq_len = int(req.prompt_len) + n_decode
         remap_by_parents(
             self.runner.req_pool.req_to_token,
             req.beam_pool_indices,
@@ -1658,11 +2889,10 @@ class BeamRecEngine:
             self.runner.free_tokens(to_free)
 
     def _free_request(self, req: BeamRequest) -> None:
-        if req.beam_list is None:
-            return
-        owned_cpu = req.beam_list.take_owned_decode_kv_cpu()
-        if owned_cpu:
-            self.runner.free_tokens(owned_cpu)
+        if req.beam_list is not None:
+            owned_cpu = req.beam_list.take_owned_decode_kv_cpu()
+            if owned_cpu:
+                self.runner.free_tokens(owned_cpu)
         if self.prefix_cache is not None and getattr(req, "prefill_kv_cpu", None):
             self._radix_cache_finished(req)
         else:

@@ -69,18 +69,55 @@ def pack_release_count(
     return n
 
 
+def admission_cost(beam_width: int, unit: str = "row", request_rows: int = 0) -> int:
+    """Slot-budget charge for one request.
+
+    ``row`` charges the real beam width. ``request`` charges a fixed width
+    (``request_rows``) so a narrow request and a wide request consume the same
+    budget. ``request_rows <= 0`` falls back to the real width.
+    """
+    width = max(int(beam_width), 1)
+    if str(unit).lower() == "request" and int(request_rows) > 0:
+        return int(request_rows)
+    return width
+
+
 def can_admit_job(
     used_slots: int,
     used_reqs: int,
     need: int,
     budget: int,
     soft_admit: int,
+    *,
+    used_rows: Optional[int] = None,
+    row_need: Optional[int] = None,
+    row_budget: Optional[int] = None,
 ) -> bool:
     if used_reqs >= int(soft_admit):
         return False
     if used_reqs > 0 and used_slots + int(need) > int(budget):
         return False
+    # Admission accounting may deliberately charge a fixed cost per request.
+    # Keep the real beam-row resource as a separate hard constraint so an
+    # under-priced request policy cannot exceed the execution/KV capacity.
+    if row_budget is not None:
+        rows = int(used_rows or 0)
+        rows_needed = int(need if row_need is None else row_need)
+        if rows + rows_needed > int(row_budget):
+            return False
     return True
+
+
+def can_admit_kv(
+    kv_available: int,
+    beam_width: int,
+    max_tokens: int,
+    num_reqs: int = 1,
+    safety_margin: float = 0.95,
+) -> bool:
+    """Check if the KV pool has enough free tokens for the requested work."""
+    need = int(beam_width) * int(max_tokens) * int(num_reqs)
+    return int(kv_available) * float(safety_margin) >= need
 
 
 def group_by_beam_depth(

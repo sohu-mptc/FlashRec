@@ -136,6 +136,7 @@ class TestPerCodebookLMHead:
             assert head.codebook_k(i) == size
 
     def test_compute_level_matches_full_compute_sliced(self):
+        """compute_level(h, i) == compute(h)[offset:offset+size] up to softmax domain."""
         head, lm_weight, cb = self._make_head()
         torch.manual_seed(7)
         hidden = torch.randn(5, 8)
@@ -146,6 +147,8 @@ class TestPerCodebookLMHead:
             assert level_lp.shape == (5, size)
             assert level_ids.tolist() == list(range(offset, offset + size))
             full_slice = full_lp[:, offset : offset + size]
+            # Per-level softmax differs from full-vocab softmax, but the
+            # argmax ordering within the level must be preserved.
             full_order = full_slice.argsort(dim=-1, descending=True)
             level_order = level_lp.argsort(dim=-1, descending=True)
             assert torch.equal(full_order, level_order)
@@ -161,6 +164,7 @@ class TestPerCodebookLMHead:
             torch.testing.assert_close(probs, torch.ones(3), atol=1e-5, rtol=1e-5)
 
     def test_small_last_codebook(self):
+        """4-level codebook with k=2 final level (boundary tokens)."""
         head, _, cb = self._make_head(vocab=26, hidden=8, codebook_sizes=[8, 8, 8, 2])
         assert head.num_levels == 4
         assert head.codebook_k(3) == 2
@@ -171,9 +175,16 @@ class TestPerCodebookLMHead:
         assert ids.tolist() == [24, 25]
 
     def test_bind_codebook_mismatch_is_noop(self):
+        """Mismatched codebook_sizes sum leaves per_codebook_ready False."""
         torch.manual_seed(0)
         lm_weight = torch.randn(10, 4)
         head = RestrictedLMHead(list(range(10)), enabled=True)
         head.bind(lm_weight)
-        head.bind_codebook([5, 3])
+        head.bind_codebook([5, 3])  # sum=8 != 10
         assert not head.per_codebook_ready
+
+    def test_level_weights_are_views(self):
+        """Level weight slices must share storage with _weight (zero-copy)."""
+        head, _, _ = self._make_head()
+        for lw in head._level_weights:
+            assert lw.storage().data_ptr() == head._weight.storage().data_ptr()

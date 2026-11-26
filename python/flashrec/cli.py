@@ -101,6 +101,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Serve-mode warmup generations run before the port opens " "(0 disables).",
     )
     p.add_argument("--max-seq-len", type=int, default=4096)
+    p.add_argument(
+        "--idle-gc-full",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow full-heap GC after 5 seconds of worker idle time, at most "
+        "once every 5 minutes (default). Use --no-idle-gc-full for young GC only.",
+    )
     p.add_argument("--length-penalty", type=float, default=1.0)
     p.add_argument("--cuda-graph-max-bs", type=int, default=800)
     p.add_argument("--mem-fraction-static", type=float, default=0.8)
@@ -112,10 +119,75 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--disable-prefill-batch", action="store_true")
     p.add_argument("--disable-fused-expand", action="store_true")
     p.add_argument("--disable-graph-expand", action="store_true")
+    p.add_argument(
+        "--disable-unary-finish",
+        action="store_true",
+        help="Do not skip the last decode when the remaining SID path is unique.",
+    )
+    p.add_argument(
+        "--enable-sparse-lm-head",
+        action="store_true",
+        help=(
+            "Renormalize log-softmax over each parent's legal trie neighbors "
+            "(legal-set scoring). Off by default: it changes cross-parent "
+            "ranking and, on OneRec BF16 beam 200, drops servable recall@32 "
+            "by about 0.33pp versus full-codebook softmax-then-mask, with no "
+            "QPS gain at beam 50 or 200. Use it to match an HF "
+            "renormalize=True reference."
+        ),
+    )
+    p.add_argument(
+        "--disable-sparse-lm-head",
+        action="store_true",
+        help=(
+            "Force full-codebook softmax-then-mask. Already the default; "
+            "kept so older launch scripts stay valid."
+        ),
+    )
+    p.add_argument("--sparse-max-outdeg", type=int, default=256)
+    p.add_argument(
+        "--enable-trie-budget",
+        action="store_true",
+        help="Restore the coverage-prefix beam budget removed in 86e5129 "
+        "(each step keeps the smallest ranked prefix covering --trie-budget-tau "
+        "of the reachable leaf mass). OFF by default; this only exists so the "
+        "trie-budget A/B can run both arms from one commit.",
+    )
+    p.add_argument("--trie-budget-n0", type=int, default=64)
+    p.add_argument("--trie-budget-tau", type=float, default=0.9)
+    p.add_argument("--trie-budget-n-max", type=int, default=0)
+    p.add_argument("--trie-budget-n-min", type=int, default=16)
+    p.add_argument(
+        "--trie-flush-leaves",
+        type=int,
+        default=0,
+        help="Enumerate catalog suffixes when subtrees are this small "
+        "(0 = off; catalog DFS order, not a model ranking).",
+    )
     p.add_argument("--disable-decode-pack", action="store_true")
+    # Wide-beam decode: read the shared prompt KV once per request per step
+    # (multi-level cascade attention). Only batches with at least
+    # --cascade-min-rows beam rows take this path; a cascade CUDA graph is
+    # captured automatically when CUDA graphs are on.
+    p.add_argument("--enable-cascade-attention", action="store_true")
+    p.add_argument("--cascade-min-rows", type=int, default=128)
+    p.add_argument(
+        "--disable-level-graph",
+        action="store_true",
+        help="Skip per-level CUDA graphs so decode reaches paged or cascade attention.",
+    )
     p.add_argument("--disable-fused-rms-fp8", action="store_true")
     p.add_argument("--disable-fused-silu-fp8", action="store_true")
     p.add_argument("--disable-fused-qk-rope-kv", action="store_true")
+    p.add_argument(
+        "--qk-norm",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Force the per-head Q/K RMSNorm instead of deriving it from the "
+            "checkpoint. auto enables it for Qwen3 and disables it for Qwen2."
+        ),
+    )
     # 0 = pipeline off (default); N>=1 = N-stage decode pipelining.
     p.add_argument("--pipeline-stages", type=int, default=0)
     # Default: follow --cuda-graph-max-bs.
@@ -130,6 +202,38 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cuda-graph-capture-sizes", default=None)
     p.add_argument("--decode-pack-min-requests", type=int, default=6)
     p.add_argument("--decode-pack-ratio", type=float, default=0.75)
+    p.add_argument(
+        "--admission-unit",
+        default="row",
+        choices=("row", "request"),
+        help="row charges each request its beam width; request charges "
+        "--admission-request-rows against the same slot budget.",
+    )
+    p.add_argument(
+        "--admission-request-rows",
+        type=int,
+        default=0,
+        help="Fixed rows charged per request when --admission-unit=request. "
+        "0 charges the real beam width.",
+    )
+    # Deadline-aware admission gate (P1-2). 0 budget = gate off (default).
+    p.add_argument(
+        "--admission-slo-budget-ms",
+        type=int,
+        default=0,
+        help="End-to-end SLO budget per request. 0 disables the deadline gate "
+        "(default). When >0, a queued request whose age plus estimated service "
+        "time exceeds this budget is dropped (HTTP 503 deadline_exceeded_error).",
+    )
+    p.add_argument("--admission-deadline-slack-ms", type=int, default=0)
+    p.add_argument("--admission-svc-base-ms", type=float, default=0.0)
+    p.add_argument("--admission-svc-per-row-ms", type=float, default=0.0)
+    p.add_argument("--admission-svc-queue-ahead-ms", type=float, default=0.0)
+    p.add_argument(
+        "--admission-deadline-source",
+        default="server",
+        choices=("server", "client"),
+    )
     p.add_argument("--schedule-policy", default="lpm", choices=("lpm", "fcfs"))
     p.add_argument("--lpm-aging-ms", type=int, default=300)
     p.add_argument("--torch-compile", action="store_true")
@@ -145,6 +249,17 @@ def _build_parser() -> argparse.ArgumentParser:
     # 0 = unbounded queue.
     p.add_argument("--max-queue-len", type=int, default=4096)
     return p
+
+
+def _sparse_lm_head_enabled(args: argparse.Namespace) -> bool:
+    """Legal-set sparse head is opt-in. ``--disable-sparse-lm-head`` is the default."""
+    enabled = bool(getattr(args, "enable_sparse_lm_head", False))
+    disabled = bool(getattr(args, "disable_sparse_lm_head", False))
+    if enabled and disabled:
+        raise ValueError(
+            "pass only one of --enable-sparse-lm-head and --disable-sparse-lm-head"
+        )
+    return enabled
 
 
 def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
@@ -168,6 +283,7 @@ def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
         warmup_user_a=args.warmup_user_a,
         warmup_user_b=args.warmup_user_b,
         warmup_iters=args.warmup_iters,
+        idle_gc_full=args.idle_gc_full,
         max_seq_len=args.max_seq_len,
         length_penalty=args.length_penalty,
         beam_width=args.beam_width,
@@ -178,7 +294,20 @@ def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
         enable_prefill_batch=not args.disable_prefill_batch,
         enable_fused_expand=not args.disable_fused_expand,
         enable_graph_expand=not args.disable_graph_expand,
+        enable_unary_finish=not args.disable_unary_finish,
+        enable_sparse_lm_head=_sparse_lm_head_enabled(args),
+        sparse_max_outdeg=args.sparse_max_outdeg,
+        enable_trie_budget=args.enable_trie_budget,
+        trie_budget_n0=args.trie_budget_n0,
+        trie_budget_tau=args.trie_budget_tau,
+        trie_budget_n_max=args.trie_budget_n_max,
+        trie_budget_n_min=args.trie_budget_n_min,
+        trie_flush_leaves=args.trie_flush_leaves,
         enable_decode_pack=not args.disable_decode_pack,
+        enable_cascade_attention=args.enable_cascade_attention,
+        cascade_min_rows=args.cascade_min_rows,
+        enable_level_graph=not args.disable_level_graph,
+        qk_norm=args.qk_norm,
         enable_fused_rms_fp8=not args.disable_fused_rms_fp8,
         enable_fused_silu_fp8=not args.disable_fused_silu_fp8,
         enable_fused_qk_rope_kv=not args.disable_fused_qk_rope_kv,
@@ -190,6 +319,14 @@ def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
         max_batch_requests=args.max_batch_requests,
         decode_pack_min_requests=args.decode_pack_min_requests,
         decode_pack_ratio=args.decode_pack_ratio,
+        admission_unit=args.admission_unit,
+        admission_request_rows=args.admission_request_rows,
+        admission_slo_budget_ms=args.admission_slo_budget_ms,
+        admission_deadline_slack_ms=args.admission_deadline_slack_ms,
+        admission_svc_base_ms=args.admission_svc_base_ms,
+        admission_svc_per_row_ms=args.admission_svc_per_row_ms,
+        admission_svc_queue_ahead_ms=args.admission_svc_queue_ahead_ms,
+        admission_deadline_source=args.admission_deadline_source,
         schedule_policy=args.schedule_policy,
         lpm_aging_ms=args.lpm_aging_ms,
         enable_torch_compile=args.torch_compile,

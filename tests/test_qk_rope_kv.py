@@ -61,3 +61,52 @@ class TestQkRopeKv:
         torch.testing.assert_close(
             v_cache[loc].float(), pool.v[0][loc].float(), atol=2e-1, rtol=2e-1
         )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_fused_without_qk_norm_matches_rope_only(self):
+        from flashrec.kernel.qk_rope_kv import fused_qk_norm_rope_store_fp8
+        from flashrec.kvcache.pool import TokenToKVPool
+
+        torch.manual_seed(5)
+        device = torch.device("cuda")
+        t, hq, hk, d = 5, 12, 2, 128
+        eps = 1e-6
+        rotary = RotaryEmbedding(d, 2048, 1_000_000, device=device)
+        q = torch.randn(t, hq, d, device=device, dtype=torch.bfloat16) * 3
+        k = torch.randn(t, hk, d, device=device, dtype=torch.bfloat16) * 3
+        v = torch.randn(t, hk, d, device=device, dtype=torch.bfloat16)
+        pos = torch.arange(t, device=device, dtype=torch.int64)
+        loc = torch.arange(t, device=device, dtype=torch.int64)
+        q2 = q.reshape(t, -1).contiguous().clone()
+        k2 = k.reshape(t, -1).contiguous().clone()
+        apply_rope_inplace(pos, q2, k2, d, rotary.cos_sin_cache)
+        pool = TokenToKVPool(1, t + 2, hk, d, torch.float8_e4m3fn, device)
+        pool.store(0, k2.view(t, hk, d), v, loc)
+
+        q_f = q.clone()
+        k_f = k.clone()
+        v_f = v.clone()
+        k_cache = torch.zeros_like(pool.k[0])
+        v_cache = torch.zeros_like(pool.v[0])
+        ones = torch.ones(d, device=device, dtype=torch.bfloat16)
+        ok = fused_qk_norm_rope_store_fp8(
+            q_f,
+            k_f,
+            v_f,
+            pos,
+            loc,
+            ones,
+            ones,
+            eps,
+            rotary.cos_sin_cache,
+            k_cache,
+            v_cache,
+            qk_norm=False,
+        )
+        assert ok
+        torch.testing.assert_close(
+            q_f.float(), q2.view(t, hq, d).float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            k_cache[loc].float(), pool.k[0][loc].float(), atol=2e-1, rtol=2e-1
+        )

@@ -1,10 +1,8 @@
-import torch
-
 from flashrec.config import BeamRecConfig
 from flashrec.core import BeamResult, BeamSequence
-from flashrec.engine.staging import fill_cpu_seq_lens
 from flashrec.hostpool import HostPool
 from flashrec.scheduler.batching import (
+    admission_cost,
     batch_wait_seconds,
     can_admit_job,
     group_by_beam_depth,
@@ -509,6 +507,40 @@ class TestInflightLoop:
             loop.step()
         assert 6 in prefills
 
+    def test_fixed_request_cost_cannot_exceed_real_row_cap(self):
+        prefills = []
+        admitted = []
+
+        def prefill(batch):
+            prefills.append(sum(r.beam_width for r in batch))
+            for r in batch:
+                r.expanded = True
+
+        def decode(reqs):
+            for r in reqs:
+                r.finished = True
+
+        loop = InflightLoop(
+            slots=2000,
+            row_cap=1000,
+            preferred=[8, 16],
+            inflight_min=8,
+            short_genrec=True,
+            prefill_fn=prefill,
+            decode_step_fn=decode,
+            complete_fn=lambda done: None,
+            slot_cost_of=lambda r: 50,
+            on_admit_fn=lambda batch: admitted.extend(batch),
+        )
+        loop.submit(_R(600, 10))
+        loop.submit(_R(600, 10))
+        loop.step()
+        assert prefills == [600]
+        assert len(loop.waiting) == 1
+        loop.step()
+        assert prefills == [600, 600]
+        assert len(admitted) == 2
+
 
 class TestGenRecAdmit:
     def test_conc1_does_not_use_wait_max(self):
@@ -567,6 +599,34 @@ class TestGenRecAdmit:
         assert can_admit_job(400, 8, 50, 800, 16)
         assert not can_admit_job(800, 8, 50, 800, 16)
         assert not can_admit_job(400, 16, 50, 800, 16)
+
+    def test_request_accounting_still_obeys_real_row_cap(self):
+        assert can_admit_job(
+            50,
+            1,
+            50,
+            4096,
+            128,
+            used_rows=3000,
+            row_need=1000,
+            row_budget=4096,
+        )
+        assert not can_admit_job(
+            50,
+            1,
+            50,
+            4096,
+            128,
+            used_rows=3500,
+            row_need=1000,
+            row_budget=4096,
+        )
+
+    def test_admission_cost_row_versus_request(self):
+        assert admission_cost(200, "row", 1000) == 200
+        assert admission_cost(50, "request", 1000) == 1000
+        assert admission_cost(1000, "request", 50) == 50
+        assert admission_cost(50, "request", 0) == 50
 
     def test_group_by_depth_does_not_merge(self):
         reqs = [_R(50, 10, 1), _R(50, 10, 1), _R(50, 10, 0)]
@@ -696,6 +756,49 @@ class TestGenRecAdmit:
         assert [j.plen for j in taken] == [40, 10]
         assert [j.plen for j in queue] == [1]
 
+    def test_lpm_request_unit_charges_fixed_width(self):
+        class J:
+            def __init__(self, n, plen):
+                self.n = n
+                self.plen = plen
+
+        queue = [J(50, 1), J(200, 2), J(1000, 3), J(50, 4)]
+        taken = select_jobs_lpm(
+            queue,
+            0,
+            0,
+            2000,
+            16,
+            lambda j: j.plen,
+            cost_of=lambda j: admission_cost(j.n, "request", 1000),
+        )
+        assert [j.plen for j in taken] == [4, 3]
+        assert [j.n for j in taken] == [50, 1000]
+        assert [j.plen for j in queue] == [1, 2]
+
+    def test_lpm_request_unit_cannot_overfill_real_rows(self):
+        class J:
+            def __init__(self, n, plen):
+                self.n = n
+                self.plen = plen
+
+        queue = [J(50, 4), J(1000, 3), J(200, 2), J(50, 1)]
+        taken = select_jobs_lpm(
+            queue,
+            0,
+            0,
+            2000,
+            16,
+            lambda j: j.plen,
+            cost_of=lambda j: admission_cost(j.n, "request", 50),
+            used_rows=0,
+            row_budget=1000,
+            row_of=lambda j: j.n,
+        )
+        assert [j.n for j in taken] == [50, 200, 50]
+        assert sum(j.n for j in taken) <= 1000
+        assert [j.n for j in queue] == [1000]
+
     def test_openai_payload_is_json_dumpsable(self):
         payload = {
             "id": "chatcmpl-x",
@@ -733,13 +836,3 @@ class TestHostPool:
         pool.flush()
         assert seen == [7]
         pool.shutdown()
-
-
-class TestFillCpuSeqLens:
-    def test_overwrites_stale_short_wave(self):
-        dest = torch.tensor([3, 3, 3], dtype=torch.int64)
-        base = torch.tensor([100, 100, 80], dtype=torch.int64)
-        fill_cpu_seq_lens(dest, base, step=0)
-        assert dest.tolist() == [101, 101, 81]
-        fill_cpu_seq_lens(dest, base, step=2)
-        assert dest.tolist() == [103, 103, 83]

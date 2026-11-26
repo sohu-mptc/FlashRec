@@ -104,6 +104,15 @@ fi
 
 OPTIONAL_ARGS=()
 [[ -n "${BEAM_WIDTH:-}" ]] && OPTIONAL_ARGS+=(--beam-width "$BEAM_WIDTH")
+[[ -n "${ADMISSION_UNIT:-}" ]] && OPTIONAL_ARGS+=(--admission-unit "$ADMISSION_UNIT")
+[[ -n "${ADMISSION_REQUEST_ROWS:-}" ]] && OPTIONAL_ARGS+=(--admission-request-rows "$ADMISSION_REQUEST_ROWS")
+[[ -n "${ADMISSION_SLO_BUDGET_MS:-}" ]] && OPTIONAL_ARGS+=(--admission-slo-budget-ms "$ADMISSION_SLO_BUDGET_MS")
+[[ -n "${ADMISSION_DEADLINE_SLACK_MS:-}" ]] && OPTIONAL_ARGS+=(--admission-deadline-slack-ms "$ADMISSION_DEADLINE_SLACK_MS")
+[[ -n "${ADMISSION_SVC_BASE_MS:-}" ]] && OPTIONAL_ARGS+=(--admission-svc-base-ms "$ADMISSION_SVC_BASE_MS")
+[[ -n "${ADMISSION_SVC_PER_ROW_MS:-}" ]] && OPTIONAL_ARGS+=(--admission-svc-per-row-ms "$ADMISSION_SVC_PER_ROW_MS")
+[[ -n "${ADMISSION_SVC_QUEUE_AHEAD_MS:-}" ]] && OPTIONAL_ARGS+=(--admission-svc-queue-ahead-ms "$ADMISSION_SVC_QUEUE_AHEAD_MS")
+[[ -n "${ADMISSION_DEADLINE_SOURCE:-}" ]] && OPTIONAL_ARGS+=(--admission-deadline-source "$ADMISSION_DEADLINE_SOURCE")
+[[ -n "${MAX_QUEUE_LEN:-}" ]] && OPTIONAL_ARGS+=(--max-queue-len "$MAX_QUEUE_LEN")
 [[ -n "${MAX_TOKENS:-}" ]] && OPTIONAL_ARGS+=(--max-tokens "$MAX_TOKENS")
 [[ -n "${WARMUP_ITERS:-}" ]] && OPTIONAL_ARGS+=(--warmup-iters "$WARMUP_ITERS")
 [[ -n "${LOG_LEVEL:-}" ]] && OPTIONAL_ARGS+=(--log-level "$LOG_LEVEL")
@@ -125,6 +134,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
     --batch-wait-max-ms "${BATCH_WAIT_MAX_MS:-10}" \
     --target-batch-requests "${TARGET_BATCH_REQUESTS:-8}" \
     --max-batch-requests "${MAX_BATCH_REQUESTS:-16}" \
+    --max-running-requests "${MAX_RUNNING_REQUESTS:-64}" \
     --schedule-policy "${SCHEDULE_POLICY:-lpm}" \
     --lpm-aging-ms "${LPM_AGING_MS:-300}" \
     ${TORCH_COMPILE:+--torch-compile} \

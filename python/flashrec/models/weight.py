@@ -68,8 +68,30 @@ def merge_qkv_weights(
     return weight, scale
 
 
-def load_hf_config(model_path: str) -> Qwen3Config:
+def _checkpoint_uses_qk_norm(cfg: dict) -> bool:
+    """Qwen3 normalizes Q/K per head. Qwen2 does not."""
+    model_type = str(cfg.get("model_type") or "")
+    arch = [str(a) for a in (cfg.get("architectures") or [])]
+    if model_type == "qwen2" or "Qwen2ForCausalLM" in arch:
+        logger.info("Qwen2 checkpoint: Q/K RMSNorm disabled")
+        return False
+    return True
+
+
+def load_hf_config(
+    model_path: str, qk_norm_override: Optional[str] = None
+) -> Qwen3Config:
+    """``qk_norm_override`` is ``"on"`` / ``"off"`` to force the per-head Q/K
+    RMSNorm regardless of what ``config.json`` implies. ``"auto"`` or ``None``
+    keeps the checkpoint-derived default. MiniOneRec is Qwen2, so auto turns
+    the norm off there; the A/B that decides which is right for a given
+    checkpoint is the only reason to override it."""
     cfg = json.loads((Path(model_path) / "config.json").read_text(encoding="utf-8"))
+    if qk_norm_override in ("on", "off"):
+        qk_norm = qk_norm_override == "on"
+        logger.info("Q/K RMSNorm forced %s (override)", qk_norm_override)
+    else:
+        qk_norm = _checkpoint_uses_qk_norm(cfg)
     return Qwen3Config(
         hidden_size=int(cfg["hidden_size"]),
         intermediate_size=int(cfg["intermediate_size"]),
@@ -84,6 +106,7 @@ def load_hf_config(model_path: str) -> Qwen3Config:
         rope_theta=float(cfg.get("rope_theta", 1000000)),
         max_position_embeddings=int(cfg.get("max_position_embeddings", 40960)),
         tie_word_embeddings=bool(cfg.get("tie_word_embeddings", True)),
+        qk_norm=qk_norm,
     )
 
 

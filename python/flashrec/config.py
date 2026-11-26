@@ -25,20 +25,27 @@ def parse_int_list(value: Optional[Union[str, Sequence[int]]]) -> Optional[List[
 
 
 def parse_sid_spec(value: str) -> Tuple[str, str, str]:
-    """Parse compact SID layout ``START:END/SIZE,...``.
+    """Parse compact SID layout ``START:END/SIZE,...[@BEGIN,END]``.
 
     Returns ``(token_range, codebook_sizes, boundary_tokens)`` as strings.
     Boundary tokens are the last codebook when its size is 2 (RecIF 4-level
     ``...,2``); otherwise they are the two ids immediately after ``END``.
+    Optional ``@BEGIN,END`` overrides that pair. SoHu-0.6B's packed 512×3
+    window keeps ``<|sid_begin|>`` / ``<|sid_end|>`` outside the window.
     """
     text = str(value).strip()
     if "/" not in text:
         raise ValueError(
-            "sid spec must be START:END/SIZE,... " "e.g. 151669:176246/8192,8192,8192,2"
+            "sid spec must be START:END/SIZE,... e.g. 151669:176246/8192,8192,8192,2"
         )
     range_s, sizes_s = text.split("/", 1)
     range_s = range_s.strip()
     sizes_s = sizes_s.strip()
+    boundary_override: Optional[str] = None
+    if "@" in sizes_s:
+        sizes_s, boundary_override = sizes_s.split("@", 1)
+        sizes_s = sizes_s.strip()
+        boundary_override = boundary_override.strip()
     if ":" not in range_s or "," in range_s:
         raise ValueError(f"sid spec range must be START:END, got {range_s!r}")
     start_s, end_s = range_s.split(":", 1)
@@ -52,13 +59,26 @@ def parse_sid_spec(value: str) -> Tuple[str, str, str]:
     n_ids = end - start + 1
     if need > n_ids:
         raise ValueError(f"sid spec codebook sum ({need}) exceeds range size ({n_ids})")
-    if sizes[-1] == 2:
+    if boundary_override:
+        if boundary_override.lower() == "none":
+            # No begin/end wrapper: the codebook tokens are the whole
+            # generation (MiniOneRec emits 3 tokens, nothing around them).
+            b0 = b1 = None
+        else:
+            parts = [p.strip() for p in boundary_override.split(",") if p.strip()]
+            if len(parts) != 2:
+                raise ValueError(
+                    f"sid spec @boundary must be BEGIN,END or none, got {boundary_override!r}"
+                )
+            b0, b1 = int(parts[0]), int(parts[1])
+    elif sizes[-1] == 2:
         b0 = start + need - 2
         b1 = start + need - 1
     else:
         b0, b1 = end + 1, end + 2
     sizes_norm = ",".join(str(s) for s in sizes)
-    return f"{start}:{end}", sizes_norm, f"{b0},{b1}"
+    boundary = "" if b0 is None else f"{b0},{b1}"
+    return f"{start}:{end}", sizes_norm, boundary
 
 
 def _sid_ids_key(value: Union[str, Sequence[int]]) -> Tuple:
@@ -141,19 +161,95 @@ class BeamRecConfig:
     enable_radix: bool = True
     enable_cuda_graph: bool = True
     enable_restricted_lm_head: bool = True
-    # Score only the active codebook at each SID depth. Without this, top-k
-    # over the full restricted head is often filled by wrong-level tokens;
-    # after the trie mask too few valid survivors remain and beams collapse
-    # into duplicate SIDs within one request.
-    enable_per_codebook_lm_head: bool = True
     enable_fused_expand: bool = True
     enable_graph_expand: bool = True
+    # Skip the last GPU decode when every remaining trie path has out-degree 1
+    # (RecIF 4-level ``sid_end``). Forced tokens add 0 to cum_logprobs.
+    enable_unary_finish: bool = True
+    # Opt-in legal-set scorer. Log-softmax over each parent's trie neighbors
+    # only. Within one parent the token order matches full-codebook
+    # softmax-then-mask; across parents the two subtract different constants,
+    # so the surviving beam changes. On OneRec-1.7B BF16 (5000 paired
+    # requests, 2026-10-20) the legal-set path is 0.00327 servable-recall@32
+    # below full-codebook at beam 200 / c=8, and the QPS at beam 50 and 200
+    # does not improve. Full-codebook is the default because it is the
+    # constrained beam search the model was trained under. Turn this on only
+    # to match an HF ``renormalize=True`` reference.
+    enable_sparse_lm_head: bool = False
+    sparse_max_outdeg: int = 256
+    # Fused CUDA scorer for the sparse path: reads lm_head rows in place rather
+    # than materializing [rows, outdeg, H], and pads to the trie's static max
+    # outdeg so no host sync is needed to size the plane. Falls back to the
+    # gather + matmul path when the JIT module is unavailable.
+    enable_fused_sparse_score: bool = True
+    # Coverage-prefix beam budget (the "budget" in trie-budget beam search):
+    # each decode step keeps only the smallest model-ranked prefix of
+    # survivors covering `tau` of the reachable leaf mass. Commit 86e5129
+    # removed this rule — it cut wide beams (200/500/1000 returned
+    # 192/480/928) and cost recall without buying throughput — so it is OFF
+    # by default here and exists only so the same commit can run both arms of
+    # that A/B. Nothing in production should set it.
+    enable_trie_budget: bool = False
+    # Floor (NOT a cap) of the per-level coverage prefix. The prefix itself is
+    # decided by trie_budget_tau over the model-ranked candidates, clamped to
+    # [max(n0, n_min), beam_width]. The old cap semantics truncated n=128/512
+    # first levels to 64 unranked survivors and collapsed recall.
+    trie_budget_n0: int = 64
+    trie_budget_tau: float = 0.9
+    trie_budget_n_max: int = 0  # 0 = beam_width
+    trie_budget_n_min: int = 16
+    # Leaf flush enumerates catalog suffixes in DFS order with tied parent
+    # scores — not a model ranking — so it is opt-in. 0 = off.
+    trie_flush_leaves: int = 0
     enable_prefill_batch: bool = True
     enable_warmup: bool = True
     enable_decode_pack: bool = True
+    # Cascade decode attention: read each request's shared prompt KV once per
+    # decode step instead of once per beam row (FlashInfer multi-level
+    # cascade). Measured on the attention kernel: ~3-4x at beam>=128 with
+    # prompt>=500 tokens, ~2x at beam=50/prompt=1000, slower below ~50 rows.
+    # When enabled, decode tries a dedicated cascade CUDA graph (padded
+    # MultiLevelCascade wrapper); missing/oversized batches stay on eager
+    # cascade. cascade_min_rows gates per batch: batches with fewer total
+    # beam rows keep the paged-graph path.
+    enable_cascade_attention: bool = False
+    cascade_min_rows: int = 128
+    # Per-level CUDA graphs return before cascade metadata is built. Turn
+    # this off when the experiment needs decode to reach paged or cascade
+    # attention; the per-codebook lm_head itself stays available.
+    enable_level_graph: bool = True
+    # Per-head Q/K RMSNorm. "auto" derives it from the checkpoint (on for
+    # Qwen3, off for Qwen2); "on"/"off" force it. MiniOneRec is Qwen2 and its
+    # two published HR@10 levels (0.158 vs 0.05) differ exactly on this flag,
+    # so the override exists to run the A/B rather than to pick a side.
+    qk_norm: str = "auto"
+    enable_kv_admission: bool = True
+    # row: the slot budget is the sum of beam widths.
+    # request: every request charges admission_request_rows against that same
+    # budget (0 charges the real width, which collapses to row accounting).
+    admission_unit: str = "row"
+    admission_request_rows: int = 0
+    # Deadline-aware admission gate (P1-2). OFF by default: with
+    # admission_slo_budget_ms<=0 the gate never drops and select_jobs_lpm
+    # output is byte-for-byte unchanged. The gate is orthogonal to
+    # admission_unit -- it reasons about wall-clock feasibility (queue age +
+    # estimated service time vs the SLO budget), not the slot charge -- so the
+    # same rule applies to both the row and request accounting arms.
+    admission_slo_budget_ms: int = 0  # per-request end-to-end SLO budget; 0 = gate off
+    admission_deadline_slack_ms: int = 0  # safety margin added to the estimate
+    admission_svc_base_ms: float = 0.0  # service-time estimator intercept
+    admission_svc_per_row_ms: float = 0.0  # estimator slope in beam width (job.n)
+    admission_svc_queue_ahead_ms: float = (
+        0.0  # estimator slope in rows ahead (0 = ignore)
+    )
+    admission_deadline_source: str = (
+        "server"  # "server" (global budget) | "client" (per-request)
+    )
     enable_fused_rms_fp8: bool = True
     enable_fused_silu_fp8: bool = True
     enable_fused_qk_rope_kv: bool = True
+    enable_next_norm_fusion: bool = False
+    enable_per_codebook_lm_head: bool = True
     schedule_policy: str = "lpm"
     # Promote jobs waiting longer than this ahead of the LPM prefix ranking.
     # 0 disables aging (pure LPM, which can starve short prompts).
@@ -177,9 +273,45 @@ class BeamRecConfig:
     cuda_graph_capture_sizes: List[int] = field(
         default_factory=lambda: [50, 100, 150, 200, 250, 300, 350, 400, 800]
     )
+    # Full-heap collection can stall HTTP ingress and decode for hundreds of ms.
+    idle_gc_full: bool = True
 
     def __post_init__(self) -> None:
         self.apply_sid_spec()
+        unit = str(self.admission_unit or "row").lower()
+        if unit not in ("row", "request"):
+            raise ValueError(f"admission_unit must be row or request, got {unit!r}")
+        self.admission_unit = unit
+        request_rows = int(self.admission_request_rows)
+        if request_rows < 0:
+            raise ValueError("admission_request_rows must be non-negative")
+        self.admission_request_rows = request_rows
+        if unit == "request" and request_rows > self.resolved_batch_slots():
+            raise ValueError(
+                "admission_request_rows cannot exceed the slot budget "
+                f"({request_rows} > {self.resolved_batch_slots()})"
+            )
+        source = str(self.admission_deadline_source or "server").lower()
+        if source not in ("server", "client"):
+            raise ValueError(
+                f"admission_deadline_source must be server or client, got {source!r}"
+            )
+        self.admission_deadline_source = source
+        self.admission_slo_budget_ms = max(int(self.admission_slo_budget_ms), 0)
+        self.admission_deadline_slack_ms = max(int(self.admission_deadline_slack_ms), 0)
+        for name in (
+            "admission_svc_base_ms",
+            "admission_svc_per_row_ms",
+            "admission_svc_queue_ahead_ms",
+        ):
+            val = float(getattr(self, name))
+            if val < 0:
+                raise ValueError(f"{name} must be non-negative, got {val!r}")
+            setattr(self, name, val)
+
+    def deadline_gate_on(self) -> bool:
+        """True when the deadline-aware admission gate is active."""
+        return int(self.admission_slo_budget_ms) > 0
 
     def apply_sid_spec(self) -> None:
         """Expand ``sid`` into token range / codebook sizes / boundary tokens."""

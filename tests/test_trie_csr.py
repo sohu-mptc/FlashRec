@@ -1,16 +1,11 @@
-"""CSR trie cache must match the dense allow/next tables exactly.
-
-The CSR layout activates automatically for large tries (dense cells over
-``FLASHREC_TRIE_DENSE_MAX_CELLS``); here we force it by shrinking the module
-threshold and compare against a dense twin built from the same sequences.
-"""
+"""Default standard CSR queries must match a retained legacy dense twin."""
 
 import random
+from unittest.mock import patch
 
 import pytest
 import torch
 
-from flashrec.search import trie as trie_mod
 from flashrec.search.trie import build_trie_from_sequences
 
 BASE = 1000
@@ -28,15 +23,12 @@ def _random_sequences(rng, n):
 
 
 def _build_pair(seqs, device):
-    dense = build_trie_from_sequences(seqs)
-    dense._ensure_gpu_cache(device)
-    saved = trie_mod._DENSE_MAX_CELLS
-    trie_mod._DENSE_MAX_CELLS = 0
-    try:
+    with patch.dict("os.environ", {"FLASHREC_TRIE_BACKEND": "legacy"}):
+        dense = build_trie_from_sequences(seqs)
+        dense._ensure_gpu_cache(device)
+    with patch.dict("os.environ", {"FLASHREC_TRIE_BACKEND": "csr"}):
         csr = build_trie_from_sequences(seqs)
         csr._ensure_gpu_cache(device)
-    finally:
-        trie_mod._DENSE_MAX_CELLS = saved
     return dense, csr
 
 
@@ -48,7 +40,10 @@ def trie_pair():
     dense, csr = _build_pair(seqs, device)
     assert dense._allow_table is not None
     assert csr._allow_table is None
-    assert csr._csr_keys is not None
+    assert csr._csr_keys is None
+    assert csr._csr_rowptr is not None
+    assert csr._csr_rowptr.numel() == len(csr._prefix_to_node) + 2
+    assert csr._csr_columns.data_ptr() == csr._edge_token.data_ptr()
     return rng, device, seqs, dense, csr
 
 
@@ -114,3 +109,9 @@ class TestTrieCsrParity:
             assert torch.equal(
                 out_d, out_c
             ), f"bootstrap mismatch at len {cur_len}:\n{out_d}\n{out_c}"
+
+    def test_unary_tables_match_dense(self, trie_pair):
+        _rng, _device, _seqs, dense, csr = trie_pair
+        assert torch.equal(dense._outdeg.cpu(), csr._outdeg.cpu())
+        assert torch.equal(dense._unary_token.cpu(), csr._unary_token.cpu())
+        assert torch.equal(dense._unary_child.cpu(), csr._unary_child.cpu())

@@ -58,7 +58,9 @@ class ModelEngine:
         ):
             kv_dtype = self.compute_dtype
 
-        self.model_config = load_hf_config(config.model_path)
+        self.model_config = load_hf_config(
+            config.model_path, qk_norm_override=config.qk_norm
+        )
         cfg = self.model_config
         free_mem = 0
         if self.device.type == "cuda":
@@ -106,11 +108,21 @@ class ModelEngine:
                 device=self.device,
             )
 
+        bw = max(int(config.beam_width), 1)
+        slots = int(config.resolved_batch_slots())
+        max_running = max(int(config.max_running_requests), 1)
+        max_bs_req = max(int(config.max_batch_requests), 1)
+        # Prefill waves allocate n*bw beam rows in one shot, and HTTP can
+        # queue a full conc-group even when max_running is 1 (n=512). Size
+        # from the slot budget and max_batch_requests, not only max_running.
+        max_reqs = max(
+            max_running * bw * 2 + 256,
+            slots + max_bs_req + 256,
+            max_bs_req * bw * 2 + 256,
+            1024,
+        )
         self.req_pool = ReqToTokenPool(
-            max_reqs=max(
-                int(config.max_running_requests) * max(int(config.beam_width), 1) + 8,
-                1024,
-            ),
+            max_reqs=max_reqs,
             max_seq_len=int(config.max_seq_len),
             device=self.device,
         )
@@ -134,6 +146,7 @@ class ModelEngine:
             fused_rms_fp8=bool(getattr(config, "enable_fused_rms_fp8", True)),
             fused_silu_fp8=bool(getattr(config, "enable_fused_silu_fp8", True)),
             fused_qk_rope_kv=bool(getattr(config, "enable_fused_qk_rope_kv", True)),
+            fuse_next_norm=bool(getattr(config, "enable_next_norm_fusion", False)),
         )
         load_weights(
             self.model,
@@ -202,9 +215,15 @@ class ModelEngine:
     def alloc_tokens(self, n: int) -> torch.Tensor:
         loc = self.kv_pool.alloc(n)
         if loc is None and self.prefix_cache is not None:
-            need = max(int(n), min(4096, int(self.prefix_cache.num_cached_tokens)))
-            self.prefix_cache.evict(need)
-            loc = self.kv_pool.alloc(n)
+            # One evict(min(n, 4096)) is not enough once radix holds unique
+            # RecIF prefixes; keep reclaiming until the alloc fits or the
+            # cache has nothing unlocked left.
+            while loc is None and int(self.prefix_cache.num_cached_tokens) > 0:
+                need = max(int(n), 4096)
+                freed = self.prefix_cache.evict(need)
+                if int(freed) <= 0:
+                    break
+                loc = self.kv_pool.alloc(n)
         if loc is None:
             raise RuntimeError(f"out of KV tokens (need {n})")
         return loc
@@ -323,7 +342,14 @@ class ModelEngine:
             return
         torch.cuda.set_device(self.device)
         try:
-            self.attn.init_graph_wrappers(capture_bs, int(self.config.max_seq_len))
+            max_cascade_reqs = 0
+            if getattr(self.config, "enable_cascade_attention", False):
+                max_cascade_reqs = int(self.config.max_batch_requests) + 1
+            self.attn.init_graph_wrappers(
+                capture_bs,
+                int(self.config.max_seq_len),
+                max_cascade_reqs=max_cascade_reqs,
+            )
         except Exception as exc:
             logger.warning("FlashInfer CUDA-graph wrappers failed: %s", exc)
             return
@@ -336,9 +362,6 @@ class ModelEngine:
         )
         logits_fn = None
         logprobs_k = None
-        # Per-codebook decode scores each SID level separately after the model
-        # forward; embedding a full-vocab lm_head into the CUDA graph would
-        # bypass that and reintroduce within-request SID collapse.
         if self.lm_head.enabled and not self._per_codebook:
             try:
                 self.lm_head.bind(self.model.lm_head())
@@ -364,8 +387,9 @@ class ModelEngine:
         if runner.graphs:
             self.graph = runner
             logger.info(
-                "CUDA graph ready: captured=%s lm_head=%s k=%s expand=%s",
+                "CUDA graph ready: captured=%s cascade=%s lm_head=%s k=%s expand=%s",
                 sorted(runner.graphs),
+                sorted(runner.graphs_cascade) if runner.graphs_cascade else False,
                 runner.captures_logprobs,
                 logprobs_k,
                 sorted(runner.graphs_expand) if runner.graphs_expand else False,
@@ -382,20 +406,49 @@ class ModelEngine:
             self.profiler.on_forward(is_prefill=bool(batch.is_prefill))
         try:
             with torch.inference_mode():
+                level = getattr(batch, "codebook_level", None)
+                if (
+                    level is not None
+                    and self.graph is not None
+                    and not batch.is_prefill
+                    and self.graph.can_replay_level(batch.n_rows, level)
+                ):
+                    lp, fused = self.graph.replay_level(
+                        batch,
+                        level,
+                        self.attn.prepare,
+                        skip_copy=bool(batch.buffers_ready),
+                    )
+                    lspec = self.graph.level_specs.get(level)
+                    cands = lspec.expand_spec.cand_ids if lspec else None
+                    return None, cands, fused
+
                 use_graph = (
                     self.graph is not None
                     and not batch.is_prefill
                     and self.graph.can_replay(batch.n_rows)
                 )
+                cascade = batch.cascade is not None
+                if cascade and use_graph:
+                    n_reqs = int(batch.cascade.qo_indptr[0].numel()) - 1
+                    use_graph = self.graph.can_replay_cascade(batch.n_rows, n_reqs)
                 if use_graph:
-                    want_expand = bool(getattr(batch, "want_expand", False)) and (
-                        self.graph.can_replay_expand(batch.n_rows)
-                    )
+                    want_expand = bool(getattr(batch, "want_expand", False))
+                    if cascade:
+                        want_expand = (
+                            want_expand
+                            and self.graph.can_replay_cascade_expand(batch.n_rows)
+                        )
+                    else:
+                        want_expand = want_expand and self.graph.can_replay_expand(
+                            batch.n_rows
+                        )
                     out, fused = self.graph.replay(
                         batch,
                         self.attn.prepare,
                         skip_copy=bool(batch.buffers_ready),
                         want_expand=want_expand,
+                        cascade=cascade,
                     )
                     if fused is not None:
                         return None, self.lm_head.token_ids, fused

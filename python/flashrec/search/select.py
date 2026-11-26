@@ -85,11 +85,15 @@ def _ranked_candidates(
     """
     num_candidates = top_logprobs.shape[1]
     scores = cum_logprobs.unsqueeze(1) + top_logprobs
+    flat = scores.reshape(-1)
+    # Sparse / heavily-masked frontiers can have fewer legal extensions than
+    # ``beam_width``; clamp so topk never raises on empty or short flats.
+    take = min(max(int(num_out), 1), max(int(flat.numel()), 1))
     if perturb is None:
-        cand_scores, cand_idx = scores.reshape(-1).topk(num_out, sorted=True)
+        cand_scores, cand_idx = flat.topk(take, sorted=True)
     else:
-        _, cand_idx = (scores + perturb).reshape(-1).topk(num_out, sorted=True)
-        cand_scores = scores.reshape(-1).gather(0, cand_idx)
+        _, cand_idx = (flat + perturb.reshape(-1)).topk(take, sorted=True)
+        cand_scores = flat.gather(0, cand_idx)
     parent = cand_idx // num_candidates
     tokens = top_tokens.reshape(-1).gather(0, cand_idx)
     return cand_scores, parent, tokens

@@ -53,6 +53,7 @@ def _try_triton():
         eps,
         BLOCK: tl.constexpr,
         HALF: tl.constexpr,
+        QK_NORM: tl.constexpr,
     ):
         row = tl.program_id(0)
         offs = tl.arange(0, BLOCK)
@@ -75,7 +76,14 @@ def _try_triton():
             x = tl.load(
                 q_ptr + row * stride_qt + h * stride_qh + offs, mask=mask, other=0.0
             ).to(tl.float32)
-            rstd = tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)
+            if QK_NORM:
+                rstd = tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)
+                w1 = qw1
+                w2 = qw2
+            else:
+                rstd = 1.0
+                w1 = 1.0
+                w2 = 1.0
             x1 = (
                 tl.load(
                     q_ptr + row * stride_qt + h * stride_qh + lo,
@@ -83,7 +91,7 @@ def _try_triton():
                     other=0.0,
                 ).to(tl.float32)
                 * rstd
-                * qw1
+                * w1
             )
             x2 = (
                 tl.load(
@@ -92,7 +100,7 @@ def _try_triton():
                     other=0.0,
                 ).to(tl.float32)
                 * rstd
-                * qw2
+                * w2
             )
             y1 = x1 * cos - x2 * sin
             y2 = x2 * cos + x1 * sin
@@ -113,7 +121,14 @@ def _try_triton():
             x = tl.load(
                 k_ptr + row * stride_kt + h * stride_kh + offs, mask=mask, other=0.0
             ).to(tl.float32)
-            rstd = tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)
+            if QK_NORM:
+                rstd = tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)
+                w1 = kw1
+                w2 = kw2
+            else:
+                rstd = 1.0
+                w1 = 1.0
+                w2 = 1.0
             x1 = (
                 tl.load(
                     k_ptr + row * stride_kt + h * stride_kh + lo,
@@ -121,7 +136,7 @@ def _try_triton():
                     other=0.0,
                 ).to(tl.float32)
                 * rstd
-                * kw1
+                * w1
             )
             x2 = (
                 tl.load(
@@ -130,7 +145,7 @@ def _try_triton():
                     other=0.0,
                 ).to(tl.float32)
                 * rstd
-                * kw2
+                * w2
             )
             y1 = (x1 * cos - x2 * sin).to(tl.bfloat16)
             y2 = (x2 * cos + x1 * sin).to(tl.bfloat16)
@@ -174,6 +189,7 @@ def fused_qk_norm_rope_store_fp8(
     cos_sin_cache: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    qk_norm: bool = True,
 ) -> bool:
     """In-place Neox RoPE on Q; RMSNorm Q/K; scatter unscaled FP8 K/V.
 
@@ -240,6 +256,7 @@ def fused_qk_norm_rope_store_fp8(
             float(eps),
             BLOCK=max(d, 32),
             HALF=max(d // 2, 16),
+            QK_NORM=bool(qk_norm),
             num_warps=4,
         )
     except Exception as exc:

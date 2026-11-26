@@ -6,13 +6,28 @@ from flashrec.search.expand import (
     init_from_prefill,
     init_from_prefill_batch,
     joint_select,
-    narrow_to_codebook_level,
+    repeat_best_legal,
 )
 from flashrec.search.score import beam_score
 from flashrec.search.trie import BeamValidPathTrie
 
 
 class TestExpand:
+    def test_repeat_best_legal_fills_dead_slots(self):
+        vals = torch.tensor([[1.0, 0.5, float("-inf"), float("-inf")]])
+        parents = torch.tensor([[2, 4, 0, 7]])
+        tokens = torch.tensor([[10, 11, 99, 98]])
+        parents, tokens = repeat_best_legal(vals, (parents, tokens))
+        assert parents.tolist() == [[2, 4, 2, 2]]
+        assert tokens.tolist() == [[10, 11, 10, 10]]
+        # An all-dead plane has no legal survivor to copy.
+        dead_vals = torch.tensor([[float("-inf"), float("-inf")]])
+        dead_parents = torch.tensor([[0, 3]])
+        dead_tokens = torch.tensor([[99, 98]])
+        kept_p, kept_t = repeat_best_legal(dead_vals, (dead_parents, dead_tokens))
+        assert torch.equal(kept_p, dead_parents)
+        assert torch.equal(kept_t, dead_tokens)
+
     def test_beam_score_matches_sglang_formula(self):
         assert round(abs(beam_score(-4.0, 2, 1.0) - -2.0), 7) == 0
         assert round(abs(beam_score(-8.0, 4, 1.0) - -2.0), 7) == 0
@@ -73,6 +88,31 @@ class TestExpand:
         assert int(bl.generated_len()) == 2
         assert bl.last_tokens.numel() == 2
 
+    def test_expand_step_accepts_padded_logprob_rows(self):
+        logprobs = torch.zeros(8, dtype=torch.float32)
+        logprobs[1] = 0.0
+        logprobs[2] = -0.4
+        bl = init_from_prefill(
+            logprobs, beam_width=2, beam_candidates=4, max_new_tokens=4, prompt_len=1
+        )
+        top_tokens = torch.tensor(
+            [[1, 2, 7], [1, 2, 7], [0, 0, 0], [0, 0, 0]], dtype=torch.int64
+        )
+        top_logprobs = torch.tensor(
+            [
+                [-0.1, -1.0, -5.0],
+                [-0.2, -0.3, -4.0],
+                [-9.0, -9.0, -9.0],
+                [-9.0, -9.0, -9.0],
+            ],
+            dtype=torch.float32,
+        )
+        parents = expand_step(
+            bl, top_tokens, top_logprobs, beam_width=2, ignore_eos=True
+        )
+        assert parents is not None
+        assert bl.last_tokens.numel() == 2
+
     def test_expand_respects_trie_mask(self):
         trie = BeamValidPathTrie(mode="trie")
         trie.children[()] = {3}
@@ -106,6 +146,26 @@ class TestExpand:
         )
         # 2 and 4 are illegal after prefix [3]; token 1 must win despite worse raw score.
         assert int(bl.last_tokens[0].item()) == 1
+
+    def test_init_repeats_legal_token_outside_narrow_window(self):
+        """A 2*beam window used to miss the only legal first code and emit it anyway."""
+        trie = BeamValidPathTrie(mode="trie")
+        trie.children[()] = {5}
+        trie.max_depth = 1
+        trie.all_tokens = {5}
+        trie.finalize_index(token_base=0, vocab_size=6)
+        logprobs = torch.tensor(
+            [-0.1, -0.2, -0.3, -0.4, -0.5, -4.0], dtype=torch.float32
+        )
+        bl = init_from_prefill(
+            logprobs,
+            beam_width=3,
+            beam_candidates=2,
+            max_new_tokens=2,
+            prompt_len=1,
+            valid_path=trie,
+        )
+        assert bl.last_tokens.tolist() == [5, 5, 5]
 
     def test_genrec_cuda_matches_pytorch(self):
         from flashrec.kernel.beam_trie import (
@@ -425,46 +485,184 @@ class TestExpand:
         assert int(res.num_finished.item()) >= 1
         assert int(res.num_survivors.item()) >= 1
 
+    def test_select_final_topk_clamps_short_frontier(self):
+        from flashrec.search.select import select_final_topk
 
-class TestNarrowToCodebookLevel:
-    """Full-vocab top-k before trie mask collapses beams; narrow first fixes it."""
+        cum = torch.zeros(2, dtype=torch.float32)
+        lp = torch.tensor([[-0.1, -1.0], [-0.2, -0.3]], dtype=torch.float32)
+        toks = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+        # beam_width larger than the flat candidate count must not raise.
+        sel = select_final_topk(cum, lp, toks, beam_width=16)
+        assert int(sel.tokens.numel()) == 4
 
-    def test_narrow_slices_active_level(self):
-        sizes = [4, 4, 2]
-        cand = torch.arange(sum(sizes), dtype=torch.int64)
-        lp = torch.randn(3, sum(sizes))
-        out_lp, out_ids = narrow_to_codebook_level(lp, cand, sizes, level=1)
-        assert out_lp.shape == (3, 4)
-        assert out_ids.tolist() == [4, 5, 6, 7]
-        torch.testing.assert_close(out_lp, lp[:, 4:8])
-
-    def test_narrow_noop_when_already_per_level(self):
-        cand = torch.arange(8, dtype=torch.int64)
-        lp = torch.randn(2, 8)
-        out_lp, out_ids = narrow_to_codebook_level(lp, cand, [8, 8], level=0)
-        assert out_lp.data_ptr() == lp.data_ptr()
-        assert out_ids.data_ptr() == cand.data_ptr()
-
-    def test_wrong_level_topk_starves_without_narrow(self):
-        """Reproduce SID collapse: wrong-level mass fills top-k."""
-        sizes = [8, 8]
-        total = sum(sizes)
-        bw, cand_k = 4, 8  # beam_candidates = 2 * bw
-        # Level-0 tokens dominate; only 1 level-1 token is in the global top-k.
-        lp = torch.full((bw, total), -20.0)
-        lp[:, :8] = torch.linspace(-0.1, -0.8, 8).unsqueeze(0).expand(bw, -1)
-        lp[:, 8] = -1.0  # sole level-1 token that can enter top-k
-        lp[:, 9:12] = torch.linspace(-2.0, -4.0, 3).unsqueeze(0).expand(bw, -1)
-
-        vals, idx = torch.topk(lp, cand_k, dim=-1)
-        level1_in_pool = (idx >= 8).sum(dim=-1)
-        assert int(level1_in_pool.min()) <= 1
-
-        narrow_lp, narrow_ids = narrow_to_codebook_level(
-            lp, torch.arange(total), sizes, level=1
+    def test_genrec_cuda_wide_beam_1000(self):
+        """n=1000 requires kBeamTrieBlock >= 1024 after the wide-beam smem bump."""
+        from flashrec.kernel.beam_trie import (
+            genrec_mask_topk_expand,
+            try_load_beam_trie,
         )
-        _nvals, nidx = torch.topk(narrow_lp, min(cand_k, narrow_lp.shape[-1]), dim=-1)
-        tokens = narrow_ids[nidx]
-        assert tokens.shape == (bw, 8)
-        assert bool((tokens >= 8).all())
-        assert int(tokens[0].unique().numel()) == 8
+
+        if not torch.cuda.is_available() or not try_load_beam_trie():
+            pytest.skip("beam_trie JIT unavailable")
+        torch.manual_seed(7)
+        n, bw, c = 1, 1000, 4
+        cum = torch.randn(n, bw, device="cuda")
+        top_lp = torch.randn(n, bw, c, device="cuda")
+        top_lp, _ = torch.topk(top_lp, c, dim=-1, largest=True, sorted=True)
+        top_tok = torch.randint(10, 20, (n, bw, c), device="cuda")
+        nodes = torch.zeros(n, bw, dtype=torch.int64, device="cuda")
+        allow = torch.ones(2, 16, dtype=torch.uint8, device="cuda")
+        token_ids = torch.randint(10, 20, (n, bw, 3), device="cuda")
+        next_node = torch.zeros(2, 16, dtype=torch.int64, device="cuda")
+        out = genrec_mask_topk_expand(
+            cum,
+            top_lp,
+            top_tok,
+            select_k=bw,
+            node_ids=nodes,
+            allow_table=allow,
+            token_base=10,
+            token_ids=token_ids,
+            col=1,
+            next_node=next_node,
+            invalid_node=0,
+        )
+        assert tuple(out.vals.shape) == (n, bw)
+        assert tuple(out.parents.shape) == (n, bw)
+
+    def test_dead_slots_repeat_best_legal_token(self):
+        """Fewer legal children than select_k must not emit a masked token."""
+        from flashrec.kernel import beam_trie as bt
+
+        if not torch.cuda.is_available() or not bt.try_load_beam_trie():
+            pytest.skip("beam_trie JIT unavailable")
+        dev = torch.device("cuda")
+        n, bw, c, k = 1, 4, 2, 4
+        # Parent 0's top token is 7, and 7 is illegal. The only legal token is 3
+        # on parent 1. Every output slot must be that legal token.
+        cum = torch.zeros(n, bw, device=dev)
+        top_lp = torch.tensor(
+            [[[0.0, -1.0], [-5.0, -4.0], [-3.0, -2.0], [-6.0, -7.0]]],
+            device=dev,
+        )
+        top_tok = torch.tensor(
+            [[[7, 8], [3, 9], [4, 5], [6, 1]]],
+            dtype=torch.int64,
+            device=dev,
+        )
+        allow = torch.zeros(2, 16, dtype=torch.uint8, device=dev)
+        allow[0, 3] = 1
+        nodes = torch.zeros(n, bw, dtype=torch.int64, device=dev)
+        token_ids = torch.arange(n * bw * 3, device=dev, dtype=torch.int64).view(
+            n, bw, 3
+        )
+        next_node = torch.zeros(2, 16, dtype=torch.int64, device=dev)
+        next_node[0, 3] = 1
+        out = bt.genrec_mask_topk_expand(
+            cum,
+            top_lp,
+            top_tok,
+            select_k=k,
+            node_ids=nodes,
+            allow_table=allow,
+            token_base=0,
+            token_ids=token_ids,
+            col=2,
+            next_node=next_node,
+            invalid_node=0,
+        )
+        assert out.tokens.tolist() == [[3, 3, 3, 3]]
+        assert out.token_ids[0, :, 2].tolist() == [3, 3, 3, 3]
+        assert torch.isfinite(out.vals[0, 0])
+        assert not torch.isfinite(out.vals[0, 1])
+
+    def test_split_select_matches_fused(self):
+        """The radix-select path must pick exactly what the K-way merge picks.
+
+        genrec_mask_topk_expand selects survivors with one warp-merge round per
+        output, so it costs ~2.3us * select_k; at RecIF's select_k=beam_width
+        =1000 that is 2.26ms and 97.5% of the kernel. call_genrec_split does the
+        same masked-plane argmax with torch.topk in 64us. Both take the max of
+        the same plane, so the outputs must agree bit for bit -- including the
+        parent/token/index of dead slots, which repeat survivor 0 when it is
+        legal and otherwise stay on the all-dead sentinel.
+        """
+        from flashrec.kernel import beam_trie as bt
+
+        if not torch.cuda.is_available() or not bt.try_load_beam_trie():
+            pytest.skip("beam_trie JIT unavailable")
+        dev = torch.device("cuda")
+        # frac controls how many children are legal; 0.0 makes every slot dead
+        # and 0.02 leaves a partially dead plane, which is where the two paths
+        # last disagreed.
+        for n, bw, c, k, frac, seed in (
+            (1, 1000, 16, 1000, 0.5, 0),
+            (1, 1000, 16, 500, 0.5, 1),
+            (4, 1000, 16, 1000, 0.5, 2),
+            (2, 256, 16, 256, 0.5, 3),
+            (1, 1000, 16, 1000, 0.02, 4),
+            (1, 1000, 16, 1000, 0.0, 5),
+            (1, 1000, 16, 1, 0.5, 6),
+        ):
+            g = torch.Generator().manual_seed(seed)
+            vsz, n_nodes, width = 64, 512, 6
+            cum = torch.randn(n, bw, generator=g).to(dev)
+            lp = torch.randn(n, bw, c, generator=g).log_softmax(-1)
+            # The fused merge assumes each row is sorted descending, which is
+            # what the caller's topk(sorted=True) produces.
+            lp, order = torch.sort(lp.to(dev), dim=-1, descending=True)
+            top_tok = (
+                torch.randint(0, vsz, (n, bw, c), generator=g, dtype=torch.int64)
+                .to(dev)
+                .gather(-1, order)
+                .contiguous()
+            )
+            kwargs = dict(
+                select_k=k,
+                node_ids=torch.randint(
+                    0, n_nodes, (n, bw), generator=g, dtype=torch.int64
+                ).to(dev),
+                allow_table=(torch.rand(n_nodes, vsz, generator=g) < frac)
+                .to(torch.uint8)
+                .to(dev),
+                token_base=0,
+                token_ids=torch.randint(
+                    0, vsz, (n, bw, width), generator=g, dtype=torch.int64
+                ).to(dev),
+                col=torch.full((n,), 2, dtype=torch.int32, device=dev),
+                next_node=torch.randint(
+                    0, n_nodes, (n_nodes, vsz), generator=g, dtype=torch.int64
+                ).to(dev),
+                invalid_node=0,
+            )
+            got = {}
+            saved = bt.GENREC_SERIAL_MERGE_MAX_K
+            try:
+                for name, threshold in (("fused", 1 << 30), ("split", 0)):
+                    bt.GENREC_SERIAL_MERGE_MAX_K = threshold
+                    got[name] = bt.genrec_mask_topk_expand(
+                        cum.contiguous(),
+                        lp.contiguous(),
+                        top_tok,
+                        workspace=bt.GenrecFusedWorkspace(),
+                        **kwargs,
+                    )
+            finally:
+                bt.GENREC_SERIAL_MERGE_MAX_K = saved
+            f, s = got["fused"], got["split"]
+            why = f"n={n} bw={bw} k={k} frac={frac}"
+            # -inf slots must line up before comparing values: -inf - -inf is nan.
+            live = torch.isfinite(f.vals)
+            assert torch.equal(live, torch.isfinite(s.vals)), why
+            assert torch.equal(f.vals[live], s.vals[live]), why
+            for field in ("parents", "tokens", "indices", "token_ids", "node_ids"):
+                assert torch.equal(
+                    getattr(f, field), getattr(s, field)
+                ), f"{field} differs at {why}"
+
+    def test_split_select_used_at_wide_beam(self):
+        """Wide beams must actually take the split path, not just tolerate it."""
+        from flashrec.kernel import beam_trie as bt
+
+        assert bt.GENREC_SERIAL_MERGE_MAX_K < 1000
+        assert bt.GENREC_SERIAL_MERGE_MAX_K >= 1

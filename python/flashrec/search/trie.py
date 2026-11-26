@@ -27,9 +27,9 @@ Supports three modes, selected automatically by configuration:
    step allows that full set (cheap safety filter; usually a no-op if lm_head
    already restricts logits).
 
-Hot path: ``mask_candidates`` keeps candidate tokens on GPU. Trie mode uses a
-cached ``allow_table[node, token-base]`` bool matrix; only the short prefix
-columns are synced once to resolve ``prefix -> node_id``.
+Trie mode defaults to standard CSR row pointers and sorted token/child arrays.
+Queries search only the current node's edges. ``FLASHREC_TRIE_BACKEND=legacy``
+retains the former dense/global-key layouts for reference comparisons.
 """
 
 from __future__ import annotations
@@ -95,10 +95,43 @@ class BeamValidPathTrie:
     _next_node: Optional[torch.Tensor] = field(
         default=None, repr=False
     )  # [N+1, V] int64
-    # CSR fallback for large tries (dense tables would not fit on GPU):
-    # sorted keys node*V+rel and the matched child ids (or sentinels).
+    # Retained legacy global-key representation, used only by the reference backend.
     _csr_keys: Optional[torch.Tensor] = field(default=None, repr=False)  # [E] int64
     _csr_child: Optional[torch.Tensor] = field(default=None, repr=False)  # [E] int64
+    _csr_rowptr: Optional[torch.Tensor] = field(
+        default=None, repr=False
+    )  # [nodes+2] int32
+    _csr_columns: Optional[torch.Tensor] = field(
+        default=None, repr=False
+    )  # [E] absolute token IDs
+    # 1D unary-path tables (dense and CSR). Indexed by global node id.
+    _outdeg: Optional[torch.Tensor] = field(default=None, repr=False)  # [N] int32
+    _unary_token: Optional[torch.Tensor] = field(default=None, repr=False)  # [N] int64
+    _unary_child: Optional[torch.Tensor] = field(default=None, repr=False)  # [N] int64
+    _leaf_count: Optional[torch.Tensor] = field(default=None, repr=False)  # [N] int32
+    # Consecutive forced (out-degree 1, valid child) steps below each node.
+    # ``suffix_len[nodes].min() >= remain`` is exactly ``can_unary_finish``,
+    # so the per-step unary gate is one gather instead of a 2*remain-sync loop.
+    _unary_suffix_len: Optional[torch.Tensor] = field(
+        default=None, repr=False
+    )  # [N] int32
+    _edge_rowptr: Optional[torch.Tensor] = field(
+        default=None, repr=False
+    )  # [N+1] int32
+    _edge_token: Optional[torch.Tensor] = field(default=None, repr=False)  # [E] int64
+    _edge_child: Optional[torch.Tensor] = field(default=None, repr=False)  # [E] int64
+    _max_outdeg: int = field(default=0, repr=False)
+    # Per-depth maximum out-degree; index is prefix length (see
+    # ``_build_unary_tables``). Lets the decode plane skip the root's width.
+    _max_outdeg_by_depth: Optional[List[int]] = field(default=None, repr=False)
+    # Host-side CSR edge lists for the Python leaf-flush walk. The tensors above
+    # are moved to GPU by _place_unary_tables and never mutated afterwards, so
+    # pulling them back per flush cost 3 x 12MB of pageable DtoH (measured 1.2ms
+    # each at a 1.5M-entry catalog) and stalled the whole decode loop. Built once
+    # here, straight off the CPU tensors, before they migrate.
+    _edge_rowptr_host: Optional[List[int]] = field(default=None, repr=False)
+    _edge_token_host: Optional[List[int]] = field(default=None, repr=False)
+    _edge_child_host: Optional[List[int]] = field(default=None, repr=False)
     _step_allow_ids: Optional[List[Optional[torch.Tensor]]] = field(
         default=None, repr=False
     )  # list of 1D int64 allowlists
@@ -187,21 +220,283 @@ class BeamValidPathTrie:
                 prefixes.insert(0, ())
             self._prefix_to_node = {p: i for i, p in enumerate(prefixes)}
             self._invalid_node = len(prefixes)  # extra all-False row
+            self._build_unary_tables()
+        else:
+            self._outdeg = None
+            self._unary_token = None
+            self._unary_child = None
+            self._leaf_count = None
+            self._unary_suffix_len = None
+            self._edge_rowptr = None
+            self._edge_token = None
+            self._edge_child = None
+            self._edge_rowptr_host = None
+            self._edge_token_host = None
+            self._edge_child_host = None
+            self._max_outdeg = 0
         self._index_ready = True
 
     def _ensure_index(self) -> None:
         if not self._index_ready:
             self.finalize_index()
 
+    def _build_unary_tables(self) -> None:
+        """CPU unary / leaf-count / CSR-edge tables from the prefix map."""
+        if self.mode != "trie" or not self._prefix_to_node:
+            self._outdeg = None
+            self._unary_token = None
+            self._unary_child = None
+            self._leaf_count = None
+            self._unary_suffix_len = None
+            self._edge_rowptr = None
+            self._edge_token = None
+            self._edge_child = None
+            self._edge_rowptr_host = None
+            self._edge_token_host = None
+            self._edge_child_host = None
+            self._max_outdeg = 0
+            return
+        p2n = self._prefix_to_node
+        n_nodes = len(p2n)
+        invalid = int(self._invalid_node)
+        max_depth = int(self.max_depth)
+        inv: List[Tuple[int, ...]] = [()] * n_nodes
+        for prefix, node_id in p2n.items():
+            inv[int(node_id)] = prefix
+        deg = [0] * n_nodes
+        tok = [-1] * n_nodes
+        child = [-1] * n_nodes
+        rowptr = [0]
+        etok: List[int] = []
+        echild: List[int] = []
+        for nid in range(n_nodes):
+            prefix = inv[nid]
+            toks = sorted(int(t) for t in (self.children.get(prefix) or ()))
+            deg[nid] = len(toks)
+            if len(toks) == 1:
+                t = toks[0]
+                tok[nid] = t
+                child_key = prefix + (t,)
+                child_id = p2n.get(child_key)
+                if child_id is not None:
+                    child[nid] = int(child_id)
+                elif len(child_key) >= max_depth:
+                    child[nid] = _UNCONSTRAINED_NODE
+                else:
+                    child[nid] = invalid
+            for t in toks:
+                etok.append(t)
+                child_key = prefix + (t,)
+                child_id = p2n.get(child_key)
+                if child_id is not None:
+                    echild.append(int(child_id))
+                elif len(child_key) >= max_depth:
+                    echild.append(_UNCONSTRAINED_NODE)
+                else:
+                    echild.append(invalid)
+            rowptr.append(len(etok))
+        lc = [0] * n_nodes
+        order = sorted(range(n_nodes), key=lambda i: -len(inv[i]))
+        for nid in order:
+            start, end = rowptr[nid], rowptr[nid + 1]
+            if start == end:
+                lc[nid] = 1 if len(inv[nid]) >= max_depth else 0
+                continue
+            s = 0
+            for e in range(start, end):
+                c = echild[e]
+                if 0 <= c < n_nodes:
+                    s += lc[c]
+                elif c == _UNCONSTRAINED_NODE:
+                    s += 1
+            lc[nid] = s
+        # Forced-suffix lengths: deepest-first, so a unary chain accumulates.
+        # A child outside [0, n_nodes) (invalid or past max depth) ends the
+        # chain after its own forced step, matching the can_unary_finish walk.
+        sfx = [0] * n_nodes
+        for nid in order:
+            if deg[nid] == 1:
+                c = child[nid]
+                sfx[nid] = 1 + (sfx[c] if 0 <= c < n_nodes else 0)
+        self._outdeg = torch.tensor(deg, dtype=torch.int32)
+        self._unary_token = torch.tensor(tok, dtype=torch.int64)
+        self._unary_child = torch.tensor(child, dtype=torch.int64)
+        self._leaf_count = torch.tensor(lc, dtype=torch.int32)
+        self._unary_suffix_len = torch.tensor(sfx, dtype=torch.int32)
+        self._edge_rowptr = torch.tensor(rowptr, dtype=torch.int32)
+        self._edge_token = torch.tensor(etok or [0], dtype=torch.int64)
+        self._edge_child = torch.tensor(echild or [-1], dtype=torch.int64)
+        # Keep the Python lists the flush walk wants; they are already built.
+        self._edge_rowptr_host = rowptr
+        self._edge_token_host = etok
+        self._edge_child_host = echild
+        if not etok:
+            self._edge_token = self._edge_token[:0]
+            self._edge_child = self._edge_child[:0]
+        self._max_outdeg = max(deg) if deg else 0
+        # Out-degree varies enormously by depth (a 4-level RecIF catalog measures
+        # 6847 / 1249 / 328 / 1). The root is only ever scored by
+        # init_from_prefill, so sizing a decode plane from the global maximum
+        # pads every row to a width no decode node can reach.
+        by_depth: List[int] = [0] * (max_depth + 1)
+        for nid in range(n_nodes):
+            d = len(inv[nid])
+            if d < len(by_depth) and deg[nid] > by_depth[d]:
+                by_depth[d] = deg[nid]
+        self._max_outdeg_by_depth = by_depth
+
+    def ensure_unary_tables(self, device: Optional[torch.device] = None) -> bool:
+        """Build unary tables if needed and optionally move them to ``device``."""
+        self._ensure_index()
+        if self._outdeg is None:
+            self._build_unary_tables()
+        if self._outdeg is None:
+            return False
+        if device is not None:
+            self._place_unary_tables(device)
+        return True
+
+    def _place_unary_tables(self, device: torch.device) -> None:
+        if self._outdeg is None:
+            return
+        tensors = (
+            "_outdeg",
+            "_unary_token",
+            "_unary_child",
+            "_leaf_count",
+            "_unary_suffix_len",
+            "_edge_rowptr",
+            "_edge_token",
+            "_edge_child",
+        )
+        first = self._outdeg
+        if first.device == device:
+            return
+        for name in tensors:
+            t = getattr(self, name)
+            if t is not None:
+                setattr(self, name, t.to(device, non_blocking=False))
+
+    def gather_neighbors(
+        self,
+        node_ids: torch.Tensor,
+        max_deg: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pad each node's CSR neighbors to ``[N, D]``.
+
+        ``D`` is ``min(max_deg, max_degree_in_frontier)`` so the padded plane
+        stays tight on dense tries (uniform low outdeg) and small on sparse
+        frontiers. Returns ``(tokens, child_ids, mask)``. Empty / invalid
+        nodes are all-false.
+        """
+        if not self.ensure_unary_tables(node_ids.device):
+            n = int(node_ids.numel())
+            z = torch.zeros(n, 1, dtype=torch.int64, device=node_ids.device)
+            return z, z, torch.zeros(n, 1, dtype=torch.bool, device=node_ids.device)
+        rowptr = self._edge_rowptr
+        etok = self._edge_token
+        echild = self._edge_child
+        nodes = node_ids.reshape(-1).to(dtype=torch.int64)
+        n_nodes = int(self._outdeg.shape[0])
+        valid = (nodes >= 0) & (nodes < n_nodes)
+        safe = nodes.clamp(0, max(n_nodes - 1, 0))
+        starts = rowptr[:-1].to(dtype=torch.int64)[safe]
+        ends = rowptr[1:].to(dtype=torch.int64)[safe]
+        deg = (ends - starts).clamp(min=0)
+        deg = torch.where(valid, deg, torch.zeros_like(deg))
+        cap = int(self._max_outdeg) if max_deg is None else max(int(max_deg), 1)
+        # Shrink the padded plane to the largest observed outdeg in the
+        # frontier; saves both gather bandwidth and softmax columns when the
+        # global maximum is from a node we never query this step.
+        live_max = int(deg.max().item())
+        d = max(min(cap, max(live_max, 1)), 1)
+        n = int(nodes.numel())
+        offs = torch.arange(d, device=nodes.device, dtype=torch.int64)
+        idx = starts.unsqueeze(1) + offs.unsqueeze(0)
+        mask = offs.unsqueeze(0) < deg.unsqueeze(1)
+        e = max(int(etok.numel()), 1)
+        idx = idx.clamp(0, e - 1)
+        tokens = etok[idx]
+        children = echild[idx]
+        tokens = torch.where(mask, tokens, torch.zeros_like(tokens))
+        children = torch.where(mask, children, torch.full_like(children, -1))
+        return tokens, children, mask
+
+    def max_outdeg_at_depth(self, depth: int) -> int:
+        """Widest out-degree among nodes at prefix length ``depth``.
+
+        Falls back to the global maximum when the per-depth table is missing.
+        """
+        table = self._max_outdeg_by_depth
+        if not table:
+            return int(self._max_outdeg)
+        d = int(depth)
+        if d < 0 or d >= len(table):
+            return int(self._max_outdeg)
+        return int(table[d])
+
+    def score_neighbors(
+        self,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        node_ids: torch.Tensor,
+        token_base: int,
+        depth: Optional[int] = None,
+    ):
+        """Fused sparse score + per-row sort over each node's legal children.
+
+        Replaces ``gather_neighbors`` + a sparse lm-head matmul + a per-row
+        ``topk``. The padded plane is sized from a static per-depth out-degree,
+        so unlike ``gather_neighbors`` this never reads a device tensor on the
+        host — that ``deg.max().item()`` was the decode path's dominant stall.
+
+        ``depth`` is the number of tokens already generated (the depth of the
+        nodes in ``node_ids``). Omit it to pad to the global maximum.
+
+        Returns a ``TrieBudgetScores`` (logprobs / tokens / children / deg), or
+        ``None`` if the CSR edge tables are unavailable.
+        """
+        from flashrec.kernel.trie_budget import trie_budget_score
+
+        if not self.ensure_unary_tables(node_ids.device):
+            return None
+        if self._edge_rowptr is None or self._edge_token is None:
+            return None
+        if self._edge_child is None or int(self._max_outdeg) <= 0:
+            return None
+        deg = (
+            int(self._max_outdeg)
+            if depth is None
+            else self.max_outdeg_at_depth(int(depth))
+        )
+        if deg <= 0:
+            return None
+        return trie_budget_score(
+            hidden,
+            weight,
+            node_ids,
+            self._edge_rowptr,
+            self._edge_token,
+            self._edge_child,
+            token_base=int(token_base),
+            invalid_node=int(self._invalid_node),
+            max_deg=deg,
+        )
+
     def _ensure_gpu_cache(self, device: torch.device) -> None:
         self._ensure_index()
         if self._cache_device == device and (
             (
                 self.mode == "trie"
-                and (self._allow_table is not None or self._csr_keys is not None)
+                and (
+                    self._allow_table is not None
+                    or self._csr_keys is not None
+                    or self._csr_rowptr is not None
+                )
             )
             or (self.mode in ("flat", "codebook") and self._flat_allow_ids is not None)
         ):
+            self._place_unary_tables(device)
             return
 
         self._cache_device = device
@@ -210,6 +505,12 @@ class BeamValidPathTrie:
 
         if self.mode == "trie":
             n_nodes = len(self._prefix_to_node)
+            backend = os.environ.get("FLASHREC_TRIE_BACKEND", "csr")
+            if backend not in ("csr", "legacy"):
+                raise ValueError("FLASHREC_TRIE_BACKEND must be csr or legacy")
+            if backend == "csr":
+                self._build_standard_csr_cache(device)
+                return
             if (n_nodes + 1) * vsz > _DENSE_MAX_CELLS:
                 self._build_csr_cache(device, base, vsz, n_nodes)
                 return
@@ -253,6 +554,7 @@ class BeamValidPathTrie:
             self._csr_child = None
             self._step_allow_ids = None
             self._flat_allow_ids = None
+            self.ensure_unary_tables(device)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             logger.info(
@@ -288,6 +590,29 @@ class BeamValidPathTrie:
                     )
         self._step_allow_ids = step_tensors
         self._allow_table = None
+
+    def _build_standard_csr_cache(self, device: torch.device) -> None:
+        """Reuse the sorted edge lists, including an empty invalid-node row.
+
+        Terminal child=-1 is a valid edge. No leaf rows or dense tables are
+        allocated; all graph levels share these global-node CSR arrays.
+        """
+        self.ensure_unary_tables(device)
+        self._csr_rowptr = torch.cat((self._edge_rowptr, self._edge_rowptr[-1:]))
+        self._csr_columns = self._edge_token
+        self._csr_child = self._edge_child
+        self._csr_keys = self._allow_table = self._next_node = None
+        size = sum(
+            t.numel() * t.element_size()
+            for t in (self._csr_rowptr, self._csr_columns, self._csr_child)
+        )
+        logger.info(
+            "Standard CSR trie ready: nodes=%d edges=%d bytes=%d device=%s",
+            self._csr_rowptr.numel() - 1,
+            self._csr_columns.numel(),
+            size,
+            device,
+        )
 
     def _build_csr_cache(
         self, device: torch.device, base: int, vsz: int, n_nodes: int
@@ -329,6 +654,7 @@ class BeamValidPathTrie:
         self._next_node = None
         self._step_allow_ids = None
         self._flat_allow_ids = None
+        self.ensure_unary_tables(device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         logger.info(
@@ -342,6 +668,134 @@ class BeamValidPathTrie:
             (n_nodes + 1) * vsz * 5 / (1024**3),
         )
 
+    def level_node_offsets(self) -> List[int]:
+        """Return the first global node ID at each trie depth.
+
+        Relies on ``finalize_index()`` sorting by ``(len(prefix), prefix)``
+        which guarantees contiguous node-ID ranges per depth.
+        """
+        self._ensure_index()
+        if not self._prefix_to_node:
+            return []
+        max_d = max(len(p) for p in self._prefix_to_node)
+        offsets = [0] * (max_d + 1)
+        for depth in range(max_d + 1):
+            first = None
+            for prefix, nid in self._prefix_to_node.items():
+                if len(prefix) == depth:
+                    if first is None or nid < first:
+                        first = nid
+            offsets[depth] = first if first is not None else 0
+        return offsets
+
+    def level_node_count(self, depth: int) -> int:
+        """Number of trie nodes at a given depth."""
+        self._ensure_index()
+        return sum(1 for p in self._prefix_to_node if len(p) == depth)
+
+    def build_level_tables(
+        self,
+        codebook_sizes: Sequence[int],
+        device: Optional[torch.device] = None,
+    ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]]:
+        """Build per-level dense allow/next tables for CUDA graph capture.
+
+        Returns ``{level: (allow_table, next_node, token_base, cand_ids)}``
+        only for levels whose dense tables fit within ``_DENSE_MAX_CELLS``.
+
+        * ``allow_table [n_level_nodes+1, codebook_k]`` bool
+        * ``next_node   [n_level_nodes+1, codebook_k]`` int32  (global node IDs)
+        * ``token_base`` = original token_base + sum(codebook_sizes[:level])
+        * ``cand_ids    [codebook_k]`` int64  — the level's SID token IDs
+        """
+        self._ensure_index()
+        if self.mode != "trie" or not self._prefix_to_node:
+            return {}
+
+        base = int(self.token_base or 0)
+        p2n = self._prefix_to_node
+        invalid = int(self._invalid_node)
+        max_depth = int(self.max_depth)
+        offsets = self.level_node_offsets()
+        cb = [int(s) for s in codebook_sizes]
+        if device is None:
+            device = self._cache_device or torch.device("cpu")
+
+        result: Dict[int, Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]] = {}
+        cb_offset = 0
+        for d, k in enumerate(cb):
+            n_nodes = self.level_node_count(d)
+            if n_nodes == 0:
+                cb_offset += k
+                continue
+            cells = (n_nodes + 1) * k
+            if cells > _DENSE_MAX_CELLS:
+                logger.info(
+                    "level %d: %d nodes × %d vocab = %d cells > %d — skip dense",
+                    d,
+                    n_nodes,
+                    k,
+                    cells,
+                    _DENSE_MAX_CELLS,
+                )
+                cb_offset += k
+                continue
+
+            level_start = offsets[d] if d < len(offsets) else 0
+            level_token_base = base + cb_offset
+
+            table_cpu = torch.zeros((n_nodes + 1, k), dtype=torch.bool)
+            next_cpu = torch.full((n_nodes + 1, k), invalid, dtype=torch.int32)
+
+            rows: List[int] = []
+            cols: List[int] = []
+            child_ids: List[int] = []
+            for prefix, node_id in p2n.items():
+                if len(prefix) != d:
+                    continue
+                local_id = node_id - level_start
+                for tok in self.children.get(prefix, ()):
+                    rel = int(tok) - level_token_base
+                    if not (0 <= rel < k):
+                        continue
+                    rows.append(local_id)
+                    cols.append(rel)
+                    child_key = prefix + (int(tok),)
+                    child_id = p2n.get(child_key)
+                    if child_id is not None:
+                        child_ids.append(int(child_id))
+                    elif len(child_key) >= max_depth:
+                        child_ids.append(_UNCONSTRAINED_NODE)
+                    else:
+                        child_ids.append(invalid)
+
+            if rows:
+                rows_t = torch.tensor(rows, dtype=torch.int64)
+                cols_t = torch.tensor(cols, dtype=torch.int64)
+                table_cpu[rows_t, cols_t] = True
+                next_cpu[rows_t, cols_t] = torch.tensor(child_ids, dtype=torch.int32)
+
+            allow_t = table_cpu.to(device, non_blocking=False)
+            next_t = next_cpu.to(device, non_blocking=False)
+            cand_ids = torch.arange(
+                level_token_base, level_token_base + k, dtype=torch.int64, device=device
+            )
+
+            result[d] = (allow_t, next_t, level_token_base, cand_ids)
+            logger.info(
+                "level %d: dense table ready: nodes=%d vocab=%d token_base=%d (~%.1f MB)",
+                d,
+                n_nodes,
+                k,
+                level_token_base,
+                (table_cpu.numel() + next_cpu.numel() * 4) / (1024 * 1024),
+            )
+            cb_offset += k
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return result
+
     def _csr_lookup(
         self, nodes: torch.Tensor, rel: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -351,6 +805,17 @@ class BeamValidPathTrie:
         [0, vsz). Returns (found_mask, child_ids) — child is the invalid
         sentinel where not found.
         """
+        if self._csr_rowptr is not None:
+            from flashrec.kernel.csr_trie import lookup
+
+            return lookup(
+                self._csr_rowptr,
+                self._csr_columns,
+                self._csr_child,
+                int(self._invalid_node),
+                nodes,
+                rel + int(self.token_base or 0),
+            )
         keys = nodes * max(int(self.vocab_size or 1), 1) + rel
         csr_keys = self._csr_keys
         e = int(csr_keys.numel())
@@ -405,7 +870,7 @@ class BeamValidPathTrie:
                 nodes = torch.where(unconstrained, nodes, nxt)
             return nodes
 
-        if self._csr_keys is not None:
+        if self._csr_keys is not None or self._csr_rowptr is not None:
             base = int(self.token_base or 0)
             vsz = max(int(self.vocab_size or 1), 1)
             invalid = int(self._invalid_node)
@@ -468,7 +933,9 @@ class BeamValidPathTrie:
             )
 
         if self.mode != "trie" or (
-            self._allow_table is None and self._csr_keys is None
+            self._allow_table is None
+            and self._csr_keys is None
+            and self._csr_rowptr is None
         ):
             return candidate_scores
 
@@ -538,7 +1005,7 @@ class BeamValidPathTrie:
         device = node_ids.device
         self._ensure_gpu_cache(device)
         if self._next_node is None:
-            if self._csr_keys is None:
+            if self._csr_keys is None and self._csr_rowptr is None:
                 return node_ids
             base = int(self.token_base or 0)
             vsz = max(int(self.vocab_size or 1), 1)
@@ -864,8 +1331,7 @@ def build_codebook_constraint(
     need = sum(sizes)
     if need > len(ids):
         raise ValueError(
-            f"sid-codebook-sizes sum ({need}) exceeds "
-            f"sid_token_range size ({len(ids)})"
+            f"sid-codebook-sizes sum ({need}) exceeds sid_token_range size ({len(ids)})"
         )
     step_allow: List[Optional[Set[int]]] = []
     offset = 0
