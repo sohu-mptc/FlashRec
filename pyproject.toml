@@ -39,7 +39,7 @@ classifiers = [
 # FlashInfer attention paths are ABI- and numerics-sensitive, so a silent major
 # upgrade can change results or fail to load rather than merely warn.
 dependencies = [
-    "apache-tvm-ffi>=0.1.5,<0.2",
+    "apache-tvm-ffi>=0.1.16,<0.2",
     "fastapi>=0.115",
     "flashinfer_python>=0.6.4,<0.7",
     "ninja>=1.11",
