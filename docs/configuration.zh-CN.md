@@ -2,7 +2,7 @@
 
 [English](configuration.md)
 
-默认值与 `flashrec --help` 及 `BeamRecConfig`（`python/flashrec/config.py`）一致。
+默认值与 `flashrec --help` 及 `FlashRecConfig`（`python/flashrec/config.py`）一致。
 
 ## 模型与 SID 词表
 
@@ -50,14 +50,22 @@ flashrec --catalog /path/to/benchmark_data
 
 显式 `--sid` 或拆分旗标若与推断结果冲突，启动会报错。
 
-## Beam search 与生成
+## 目录约束的宽束搜索
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--beam-width`（别名 `--n`） | `50` | 默认 beam 宽度；请求体 `n` 可覆盖。也决定 fused-expand 的 graph 捕获宽度——单实例服务一种主力 beam 宽度性能最优。 |
+| `--full-codebook-scoring`（别名 `--disable-sparse-lm-head`） | 开 | 全码本评分（FR-full）在当前 SID 层的整个码本上归一化，再屏蔽 trie 中的非法边。 |
+| `--legal-set-scoring`（别名 `--enable-sparse-lm-head`） | 关 | 合法集合评分（FR-legal）在每个前缀的合法子节点上归一化，可能改变不同前缀之间的排序。 |
+| `--disable-unary-finish` | 关 | 在确定性 trie 搜索中，关闭免模型调用的唯一后缀补全（unary finish）。此开关独立于评分模式。 |
+| `--enable-trie-budget` | 关 | 启用按覆盖率截断前沿，用于论文中完整前沿与截断前沿的消融。 |
 | `--max-tokens` | `5` | 默认最大生成 token 数（SID 步数）；请求体可覆盖。 |
 | `--length-penalty` | `1.0` | beam 分数的长度惩罚。 |
 | `--prompt` / `--messages-json` | 不设 | 离线单次生成（与 `--serve` 互斥）。 |
+
+运行 FR-legal 时，使用 `--disable-level-graph` 跳过逐层 graph 内的全码本评分。
+合法集合评分适用于评分器支持的 trie 层。层的最大出度超出评分器上限时，
+回退到全码本评分。
 
 ## 显存与后端
 
@@ -69,13 +77,20 @@ flashrec --catalog /path/to/benchmark_data
 | `--cuda-graph-capture-sizes` | `50,100,…,400,800` | 显式捕获尺寸；自动扩展到 beam 宽度的整数倍。 |
 | `--attention-backend` | `flashinfer` | Attention 后端。 |
 | `--flashinfer-variant` | `fa2` | FlashInfer kernel 变体。 |
+| `--enable-beam-shared-attention`（别名 `--enable-cascade-attention`） | 关 | 束间共享注意力（BSA）通过 FlashInfer cascade 路径复用同一请求各 beam 的 prompt KV 读取。 |
+| `--beam-shared-attention-min-rows`（别名 `--cascade-min-rows`） | `128` | 启用 BSA 所需的最小 decode 批次活跃 beam 行数。 |
 | `--gpu-id` | `0` | CUDA 设备编号。 |
+
+满足条件时，逐层 CUDA graph 会优先于 BSA 执行。使用 `--disable-level-graph`
+可让这些批次进入 BSA 路径。BSA 优先重放匹配的 cascade graph，其余符合 BSA
+条件的批次使用 eager cascade。
 
 ## 合批与调度
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--batch-slots` | 跟随 `--cuda-graph-max-bs` | 单波 beam 行槽位预算（≈ 请求数 × beam 宽度）。 |
+| `--admission-unit` | `row` | 按请求的 beam 宽度计入准入预算。设为 `request` 且 `--admission-request-rows` 大于零时，按该固定值计入。 |
 | `--batch-wait-ms` | `4` | 第一次 expand 前的基础合批等待。 |
 | `--batch-wait-max-ms` | `10` | 欠填时最长再等；也是队头请求可被拖延的上限。 |
 | `--target-batch-requests` | `8` | 未凑够该请求数时继续等（受最长等待约束）；也是在途拉新请求的阈值。 |
@@ -99,7 +114,7 @@ CUDA_GRAPH_MAX_BS=4096 BATCH_SLOTS=4096 LPM_AGING_MS=150 \
 ```
 
 `--beam-width` 决定 fused-expand 的捕获宽度；graph 尺寸自动扩展到
-`k × n`（见 `BeamRecConfig.resolved_cuda_graph_sizes`）。
+`k × n`（见 `FlashRecConfig.resolved_cuda_graph_sizes`）。
 
 ## 功能开关（消融）
 

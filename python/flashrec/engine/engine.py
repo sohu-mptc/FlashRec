@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from flashrec.attention.flashinfer import AttentionBackend
-from flashrec.config import BeamRecConfig
+from flashrec.config import FlashRecConfig
 from flashrec.core import ForwardBatch
 from flashrec.engine.graph import DecodeGraphRunner, ExpandCaptureSpec
 from flashrec.engine.staging import PinnedStage
@@ -35,7 +35,7 @@ def _dtype(name: str) -> torch.dtype:
 
 
 class ModelEngine:
-    def __init__(self, config: BeamRecConfig):
+    def __init__(self, config: FlashRecConfig):
         resolve_sid_layout(config)
         self.config = config
         self.device = torch.device(

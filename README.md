@@ -4,8 +4,9 @@
 
 **[Features](#features)** | **[Quickstart](#quickstart)** | **Documentation** | **Examples** | **[Architecture](#architecture)** | **API** | **Evaluation** | **FAQ** | **[简体中文](README.zh-CN.md)**
 
-**An inference engine for generative recommendation, based on mini-sglang:**
-**wide beam search over a semantic-ID catalog, executed inside CUDA graphs.**
+**FlashRec serves generative recommendation with catalog-constrained wide-beam search.**
+
+**Paper** · [FlashRec: Serving Generative Recommendation with Catalog-Constrained Wide-Beam Search (PDF)](docs/papers/paper.pdf)
 
 ---
 
@@ -39,17 +40,20 @@ Throughput scales with beam width `n` and concurrency; the illegal-SID rate is
 
 **Decoding**
 
-- **CUDA graphs.** Beam widths from 50 to 512+ run in captured graphs, including
-the beam-expansion step. Capture sizes extend to multiples of the configured
-width, so a wide beam is a single graph replay.
-- **SID constraint.** A fused CUDA kernel (dense or CSR-sparse trie) restricts
-decoding to a catalog of valid semantic IDs. `lm_head` is evaluated only over
-the SID token range. Illegal SIDs are never candidates, so `invalid_rate` is
-0; open-vocabulary baselines leave ~17–27% of beams illegal.
-- **Scheduling.** Requests are admitted into decode waves between steps under a
-beam-row slot budget, so beam rows from different requests share a step. A
-radix prefix KV cache with longest-prefix-match scheduling reduces the cost of
-shared prompts; aging prevents starvation.
+- **CUDA graph replay.** Eligible model, SID-head and expansion paths replay
+CUDA graphs over persistent device buffers. Capture sizes are multiples of
+the configured beam width.
+- **Catalog-constrained wide-beam search.** A dense or CSR catalog trie restricts
+GPU expansion to valid SID continuations. Default full-codebook scoring
+(FR-full, `--full-codebook-scoring`) normalizes over the current SID codebook
+before masking. Legal-set scoring (FR-legal, `--legal-set-scoring`) normalizes
+over each prefix's legal children. Unary finish skips model calls when every
+live beam has a unique remaining suffix.
+- **Beam-row admission and shared prefill.** Each request is charged its
+requested beam width against the row budget. FlashRec prefills each prompt
+once and shares its KV page references across beams. The GPU-selected parent
+map advances SID histories and trie nodes and remaps generated-suffix KV
+references without copying KV tensors.
 
 **Serving**
 
@@ -289,16 +293,30 @@ disclosure process in [Security](SECURITY.md).
 
 ## Citation
 
+To cite the preprint, use this entry. [Paper PDF](docs/papers/paper.pdf)
+
+```bibtex
+@unpublished{wang2026flashrec,
+  title  = {{FlashRec}: Serving Generative Recommendation with Catalog-Constrained Wide-Beam Search},
+  author = {Wang, Chongyang},
+  year   = {2026},
+  note   = {Preprint},
+  url    = {https://github.com/sohu-mptc/FlashRec/blob/main/docs/papers/paper.pdf}
+}
+```
+
+To cite the software, use this entry.
+
 ```bibtex
 @software{flashrec,
-  title  = {FlashRec: A Wide-Beam Inference Engine for Generative Recommendation},
+  title  = {{FlashRec}},
   author = {Wang, Chongyang and {sohu-mptc}},
   year   = {2026},
   url    = {https://github.com/sohu-mptc/FlashRec}
 }
 ```
 
-GitHub also exposes this via [CITATION.cff](CITATION.cff).
+Both citations are available in [CITATION.cff](CITATION.cff).
 
 ## License
 

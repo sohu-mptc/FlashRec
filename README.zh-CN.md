@@ -4,8 +4,9 @@
 
 **[特性](#主要特性)** | **[快速开始](#快速开始)** | **文档** | **示例** | **[架构](#架构)** | **API** | **评测** | **FAQ** | **[English](README.md)**
 
-**生成式推荐推理引擎（基于 mini-sglang）：在语义 ID 目录上执行宽 beam search，**
-**解码路径在 CUDA graph 内完成。**
+**FlashRec 通过目录约束宽束搜索为生成式推荐提供推理服务。**
+
+**论文** · [FlashRec: Serving Generative Recommendation with Catalog-Constrained Wide-Beam Search（PDF）](docs/papers/paper.pdf)
 
 ---
 
@@ -36,14 +37,17 @@ SID 率由 trie 约束保证为 0。评测结果见 [评测](#评测)。
 
 **解码**
 
-- **CUDA graph。** beam 宽度 50–512 及以上的解码路径（含 beam 扩展）在捕获的
-CUDA graph 内执行；捕获尺寸按配置宽度的整数倍选取，宽 beam 一次重放即可完成。
-- **SID 约束。** 由融合 CUDA kernel（稠密或 CSR 稀疏 trie）将解码限制在合法语义
-ID 目录内，`lm_head` 仅在 SID token 区间计算。非法 SID 不进入候选，
-`invalid_rate` 为 0；开放词表基线的非法 beam 比例约为 17–27%。
-- **调度。** 按 beam 行槽位预算在 decode 步之间准入请求，不同请求的 beam 行可在
-同一步内批处理。前缀 KV cache 采用 radix 结构，调度策略为最长前缀匹配（LPM），
-并以 aging 避免饥饿。
+- **CUDA graph 重放。** 满足捕获条件的模型前向、SID 输出头和扩展路径复用 GPU
+缓冲区进行 CUDA graph 重放。捕获尺寸为配置 beam 宽度的整数倍。
+- **目录约束宽束搜索。** 稠密或 CSR 目录 trie 将 GPU 扩展限制在合法 SID 续写上。
+默认的全码本评分（FR-full，`--full-codebook-scoring`）先在当前 SID 层的完整码本
+上归一化，再屏蔽非法边。合法集合评分（FR-legal，`--legal-set-scoring`）只在各前缀
+的合法子节点上归一化。当所有活跃 beam 的剩余后缀唯一时，确定性后缀补全（unary
+finish）可跳过模型调用。
+- **按 beam 行数准入与共享 prefill。** 每个请求按其指定的 beam 宽度扣减行数预算。
+FlashRec 对每个 prompt 只做一次 prefill，各 beam 共享 prompt KV 页引用。GPU 选出的
+父索引映射同步更新 SID 历史和 trie 节点，并在无需复制 KV 张量的情况下重映射生成
+后缀的 KV 引用。
 
 **服务**
 
@@ -264,16 +268,30 @@ FLASHREC_DIFF_QUANT=bf16 \
 
 ## 引用
 
+论文引用见以下 BibTeX。[论文 PDF](docs/papers/paper.pdf)
+
+```bibtex
+@unpublished{wang2026flashrec,
+  title  = {{FlashRec}: Serving Generative Recommendation with Catalog-Constrained Wide-Beam Search},
+  author = {Wang, Chongyang},
+  year   = {2026},
+  note   = {Preprint},
+  url    = {https://github.com/sohu-mptc/FlashRec/blob/main/docs/papers/paper.pdf}
+}
+```
+
+软件引用见以下 BibTeX。
+
 ```bibtex
 @software{flashrec,
-  title  = {FlashRec: A Wide-Beam Inference Engine for Generative Recommendation},
+  title  = {{FlashRec}},
   author = {Wang, Chongyang and {sohu-mptc}},
   year   = {2026},
   url    = {https://github.com/sohu-mptc/FlashRec}
 }
 ```
 
-GitHub 的 Cite this repository 读取 [CITATION.cff](CITATION.cff)。
+论文和软件引用也收录在 [CITATION.cff](CITATION.cff)。
 
 ## License
 

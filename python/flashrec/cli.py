@@ -10,14 +10,17 @@ import textwrap
 from pathlib import Path
 from typing import List, Optional
 
-from flashrec.config import BeamRecConfig, parse_int_list
+from flashrec.config import FlashRecConfig, parse_int_list
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="flashrec",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="FlashRec: beam-search engine for generative recommendation",
+        description=(
+            "FlashRec: Serving Generative Recommendation with "
+            "Catalog-Constrained Wide-Beam Search"
+        ),
         epilog=textwrap.dedent("""\
             examples:
               flashrec --catalog /path/to/benchmark_data
@@ -122,36 +125,32 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--disable-unary-finish",
         action="store_true",
-        help="Do not skip the last decode when the remaining SID path is unique.",
+        help="Disable forced trie suffix completion (unary finish).",
     )
     p.add_argument(
+        "--legal-set-scoring",
         "--enable-sparse-lm-head",
+        dest="enable_sparse_lm_head",
         action="store_true",
-        help=(
-            "Renormalize log-softmax over each parent's legal trie neighbors "
-            "(legal-set scoring). Off by default: it changes cross-parent "
-            "ranking and, on OneRec BF16 beam 200, drops servable recall@32 "
-            "by about 0.33pp versus full-codebook softmax-then-mask, with no "
-            "QPS gain at beam 50 or 200. Use it to match an HF "
-            "renormalize=True reference."
-        ),
+        help="Legal-set scoring (FR-legal): normalize over each parent's legal trie children.",
     )
     p.add_argument(
+        "--full-codebook-scoring",
         "--disable-sparse-lm-head",
+        dest="disable_sparse_lm_head",
         action="store_true",
         help=(
-            "Force full-codebook softmax-then-mask. Already the default; "
-            "kept so older launch scripts stay valid."
+            "Full-codebook scoring (FR-full, default): normalize over the current "
+            "SID codebook, then mask illegal trie edges."
         ),
     )
     p.add_argument("--sparse-max-outdeg", type=int, default=256)
     p.add_argument(
         "--enable-trie-budget",
         action="store_true",
-        help="Restore the coverage-prefix beam budget removed in 86e5129 "
-        "(each step keeps the smallest ranked prefix covering --trie-budget-tau "
-        "of the reachable leaf mass). OFF by default; this only exists so the "
-        "trie-budget A/B can run both arms from one commit.",
+        help="Use the truncated frontier from the trie-budget ablation. Each step "
+        "keeps a ranked prefix targeting --trie-budget-tau of the reachable leaf "
+        "mass. The default keeps the full frontier up to the requested beam width.",
     )
     p.add_argument("--trie-budget-n0", type=int, default=64)
     p.add_argument("--trie-budget-tau", type=float, default=0.9)
@@ -165,16 +164,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "(0 = off; catalog DFS order, not a model ranking).",
     )
     p.add_argument("--disable-decode-pack", action="store_true")
-    # Wide-beam decode: read the shared prompt KV once per request per step
-    # (multi-level cascade attention). Only batches with at least
-    # --cascade-min-rows beam rows take this path; a cascade CUDA graph is
-    # captured automatically when CUDA graphs are on.
-    p.add_argument("--enable-cascade-attention", action="store_true")
-    p.add_argument("--cascade-min-rows", type=int, default=128)
+    p.add_argument(
+        "--enable-beam-shared-attention",
+        "--enable-cascade-attention",
+        dest="enable_cascade_attention",
+        action="store_true",
+        help="Enable beam-shared attention (BSA) to reuse prompt KV reads across beams.",
+    )
+    p.add_argument(
+        "--beam-shared-attention-min-rows",
+        "--cascade-min-rows",
+        dest="cascade_min_rows",
+        type=int,
+        default=128,
+        metavar="ROWS",
+        help="Minimum decode batch size in beam rows for BSA (default: 128).",
+    )
     p.add_argument(
         "--disable-level-graph",
         action="store_true",
-        help="Skip per-level CUDA graphs so decode reaches paged or cascade attention.",
+        help="Skip per-level CUDA graphs so decode reaches paged or beam-shared attention.",
     )
     p.add_argument("--disable-fused-rms-fp8", action="store_true")
     p.add_argument("--disable-fused-silu-fp8", action="store_true")
@@ -252,18 +261,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _sparse_lm_head_enabled(args: argparse.Namespace) -> bool:
-    """Legal-set sparse head is opt-in. ``--disable-sparse-lm-head`` is the default."""
+    """Choose legal-set scoring when explicitly enabled."""
     enabled = bool(getattr(args, "enable_sparse_lm_head", False))
     disabled = bool(getattr(args, "disable_sparse_lm_head", False))
     if enabled and disabled:
         raise ValueError(
-            "pass only one of --enable-sparse-lm-head and --disable-sparse-lm-head"
+            "pass only one of --legal-set-scoring and --full-codebook-scoring"
         )
     return enabled
 
 
-def config_from_args(args: argparse.Namespace) -> BeamRecConfig:
-    cfg = BeamRecConfig(
+def config_from_args(args: argparse.Namespace) -> FlashRecConfig:
+    cfg = FlashRecConfig(
         model_path=args.model_path,
         mem_fraction_static=args.mem_fraction_static,
         quantization=args.quantization,
@@ -368,9 +377,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         serve(cfg)
         return 0
-    from flashrec.scheduler.scheduler import BeamRecEngine
+    from flashrec.scheduler.scheduler import FlashRecEngine
 
-    engine = BeamRecEngine(cfg)
+    engine = FlashRecEngine(cfg)
     messages = json.loads(args.messages_json) if args.messages_json else None
     result = engine.generate(
         prompt=args.prompt,

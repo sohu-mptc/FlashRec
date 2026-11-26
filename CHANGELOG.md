@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added the [FlashRec preprint](docs/papers/paper.pdf), *FlashRec: Serving
+  Generative Recommendation with Catalog-Constrained Wide-Beam Search*, with
+  links and citation information in both READMEs.
+- Added `--full-codebook-scoring` (FR-full), `--legal-set-scoring` (FR-legal),
+  `--enable-beam-shared-attention` (BSA), and
+  `--beam-shared-attention-min-rows` as aliases for the existing options.
+
+### Changed
+
+- Aligned the CLI and documentation with the paper's terminology. The Python
+  API now uses `FlashRecConfig`, `FlashRecEngine`, and `FlashRecServer`.
+  Existing `BeamRec*` imports and server launch commands remain compatible.
+
 ## [0.1.3] - 2026-11-26
 
 Added cascade attention, CSR trie operators, deadline-aware SLO admission,

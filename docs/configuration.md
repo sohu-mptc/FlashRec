@@ -2,7 +2,7 @@
 
 [简体中文](configuration.zh-CN.md)
 
-Defaults match `flashrec --help` and `BeamRecConfig` (`python/flashrec/config.py`).
+Defaults match `flashrec --help` and `FlashRecConfig` (`python/flashrec/config.py`).
 
 ## Model & SID vocabulary
 
@@ -53,14 +53,23 @@ scheme:
 An explicit `--sid` or split flag that disagrees with the inferred layout is an
 error.
 
-## Beam search & generation
+## Catalog-constrained wide-beam search
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--beam-width` (alias `--n`) | `50` | Default beam width; per-request `n` overrides it. Also sets the fused-expand graph capture width — a single instance performs best serving one dominant beam width. |
+| `--full-codebook-scoring` (alias `--disable-sparse-lm-head`) | on | FR-full normalizes over the current SID level's codebook and then masks illegal trie edges. |
+| `--legal-set-scoring` (alias `--enable-sparse-lm-head`) | off | FR-legal renormalizes over each prefix's legal trie children. That can change the ranking across prefixes. |
+| `--disable-unary-finish` | off | Disable the shortcut that appends a uniquely determined catalog suffix without model calls in deterministic trie search. Unary finish is independent of the scoring mode. |
+| `--enable-trie-budget` | off | Enable coverage-prefix truncation for the paper's full versus truncated frontier ablation. |
 | `--max-tokens` | `5` | Default max generated tokens (SID steps); per-request override. |
 | `--length-penalty` | `1.0` | Beam-score length penalty. |
 | `--prompt` / `--messages-json` | unset | Offline single-shot generation (mutually exclusive with `--serve`). |
+
+For an FR-legal run, pass `--disable-level-graph` to bypass the per-level graph's
+full-codebook scorer. The legal-set scorer applies to supported trie levels.
+Levels that exceed the available scorer's fan-out limit use full-codebook
+scoring.
 
 ## Memory & backends
 
@@ -72,13 +81,21 @@ error.
 | `--cuda-graph-capture-sizes` | `50,100,…,400,800` | Explicit capture sizes; automatically extended to multiples of the beam width. |
 | `--attention-backend` | `flashinfer` | Attention backend. |
 | `--flashinfer-variant` | `fa2` | FlashInfer kernel variant. |
+| `--enable-beam-shared-attention` (alias `--enable-cascade-attention`) | off | Beam-shared attention (BSA) reuses prompt KV reads across a request's beams on the FlashInfer cascade path. |
+| `--beam-shared-attention-min-rows` (alias `--cascade-min-rows`) | `128` | Minimum total live beam rows in a decode batch for BSA. |
 | `--gpu-id` | `0` | CUDA device index. |
+
+Eligible per-level CUDA graphs take precedence over BSA. Pass
+`--disable-level-graph` to reach the BSA path in those batches. With BSA active,
+decode replays a matching cascade graph when available and uses eager cascade
+for other eligible batches.
 
 ## Batching & scheduling
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--batch-slots` | follows `--cuda-graph-max-bs` | Beam-row slot budget per wave (≈ requests × beam width). |
+| `--admission-unit` | `row` | Beam-row admission charges each request its requested beam width. `request` uses the charge from `--admission-request-rows` when that value is positive. |
 | `--batch-wait-ms` | `4` | Base batching wait before the first expand. |
 | `--batch-wait-max-ms` | `10` | Max extra wait when under-filled; upper bound on head-of-queue delay. |
 | `--target-batch-requests` | `8` | Keep waiting (bounded by max wait) until this many requests are queued; also the in-flight refill threshold. |
@@ -103,7 +120,7 @@ CUDA_GRAPH_MAX_BS=4096 BATCH_SLOTS=4096 LPM_AGING_MS=150 \
 ```
 
 `--beam-width` sets the fused-expand capture width; graph sizes automatically
-extend to `k × n` (`BeamRecConfig.resolved_cuda_graph_sizes`).
+extend to `k × n` (`FlashRecConfig.resolved_cuda_graph_sizes`).
 
 ## Ablation switches
 

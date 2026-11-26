@@ -1,3 +1,3 @@
-from flashrec.scheduler.scheduler import BeamRecEngine
+from flashrec.scheduler.scheduler import BeamRecEngine, FlashRecEngine
 
-__all__ = ["BeamRecEngine"]
+__all__ = ["FlashRecEngine", "BeamRecEngine"]

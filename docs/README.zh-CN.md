@@ -9,6 +9,7 @@
 
 | | |
 | --- | --- |
+| **[论文（PDF）](papers/paper.pdf)** | FlashRec: Serving Generative Recommendation with Catalog-Constrained Wide-Beam Search |
 | **[架构](architecture.md)** | 模块结构与请求路径 |
 | **[API](api.md)** | HTTP 接口、响应结构、Python 接口 |
 | **[参数](configuration.zh-CN.md)** | 命令行参数与环境变量 |

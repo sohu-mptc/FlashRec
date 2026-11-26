@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from flashrec.config import BeamRecConfig
+from flashrec.config import FlashRecConfig
 from flashrec.core import BeamRequest, BeamResult
 from flashrec.profiler import ProfileCommand, TorchProfiler, trace_range
 from flashrec.scheduler.batching import (
@@ -25,7 +25,7 @@ from flashrec.scheduler.batching import (
     can_admit_job,
     pack_release_count,
 )
-from flashrec.scheduler.scheduler import BeamRecEngine
+from flashrec.scheduler.scheduler import FlashRecEngine
 
 logger = logging.getLogger(__name__)
 
@@ -295,10 +295,10 @@ class _Job:
     prefix_len_cache: Optional[int] = None
 
 
-class BeamRecServer:
-    def __init__(self, config: BeamRecConfig):
+class FlashRecServer:
+    def __init__(self, config: FlashRecConfig):
         self.config = config
-        self.engine = BeamRecEngine(config)
+        self.engine = FlashRecEngine(config)
         self.profiler = TorchProfiler()
         self.engine.attach_profiler(self.profiler)
         self._queue: List[_Job] = []
@@ -1293,9 +1293,12 @@ def _tune_gc_after_startup() -> None:
     )
 
 
-def serve(config: BeamRecConfig) -> None:
+BeamRecServer = FlashRecServer
+
+
+def serve(config: FlashRecConfig) -> None:
     _install_gc_probe()
-    server = BeamRecServer(config)
+    server = FlashRecServer(config)
     # Freeze only after graph capture + warmup: freezing while the worker is
     # still inside ensure_cuda_graph() leaves capture-time allocations
     # unfrozen, so gen-2 passes keep retracing them. The port binds only after

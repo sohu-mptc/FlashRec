@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "flashrec"
 # Single source of truth: python/flashrec/version.py.
 dynamic = ["version"]
-description = "Beam-search inference engine for generative recommendation (SID decoding with trie constraints)."
+description = "Serving runtime for generative recommendation with catalog-constrained wide-beam search."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

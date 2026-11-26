@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline single-request beam search against a local checkpoint.
+"""Offline single-request FlashRec generation against a local checkpoint.
 
 Runs the engine in-process: no server, no HTTP. Use this to sanity-check a
 checkpoint and its SID catalog before putting a server in front of it.
@@ -7,7 +7,7 @@ checkpoint and its SID catalog before putting a server in front of it.
     # Unconstrained (decodes over the full vocabulary):
     python examples/offline_single_request.py --model-path /path/to/OneRec-1.7B
 
-    # Trie-constrained to a catalog (layout inferred from the tokenizer):
+    # Catalog-constrained wide-beam search (layout inferred from the tokenizer)
     python examples/offline_single_request.py \
       --model-path /path/to/OneRec-1.7B \
       --sid-vocab-file data/catalogs/sid2pid_beamrec_l4.json
@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-from flashrec import BeamRecConfig, BeamRecEngine
+from flashrec import FlashRecConfig, FlashRecEngine
 
 DEFAULT_PROMPT = (
     "The user has watched the following videos: "
@@ -53,7 +53,7 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    config = BeamRecConfig(
+    config = FlashRecConfig(
         model_path=args.model_path,
         beam_width=args.beam_width,
         max_tokens=args.max_tokens,
@@ -64,9 +64,7 @@ def main() -> int:
         sid_boundary_tokens=args.sid_boundary_tokens,
     )
 
-    # Loads weights, allocates the KV pool, and captures CUDA graphs; the first
-    # call is slow, steady-state cost is one graph replay per decode step.
-    engine = BeamRecEngine(config)
+    engine = FlashRecEngine(config)
 
     result = engine.generate(
         prompt=args.prompt,

@@ -24,8 +24,9 @@ public address only on a trusted network or behind an authenticating proxy.
 
 ## `POST /v1/chat/completions`
 
-Beam search over a chat prompt. Each beam is returned as one `choices[]` entry,
-ranked best-first by cumulative log-probability.
+With a SID catalog loaded, the endpoint runs catalog-constrained wide-beam
+search over a chat prompt. Each beam is returned as one `choices[]` entry,
+ranked best-first by cumulative log-probability with the length penalty applied.
 
 ### Request
 
@@ -118,10 +119,10 @@ Body fields: `output_dir`, `start_step`, `num_steps`, `activities`,
 For offline use, drive the engine in-process:
 
 ```python
-from flashrec import BeamRecConfig, BeamRecEngine
+from flashrec import FlashRecConfig, FlashRecEngine
 
-engine = BeamRecEngine(
-    BeamRecConfig(
+engine = FlashRecEngine(
+    FlashRecConfig(
         model_path="/path/to/model",
         sid_vocab_file="data/catalogs/sid2pid_beamrec_l4.json",
     )
@@ -132,6 +133,8 @@ for seq in result.sequences:          # ranked best-first
     print(seq.beam_score, seq.text)
 ```
 
-`engine.generate_many([...])` batches a list of requests built with
-`engine.make_request(...)`. Runnable versions of both:
-[Examples](../examples/).
+`BeamRecConfig` and `BeamRecEngine` are compatibility aliases for
+`FlashRecConfig` and `FlashRecEngine`.
+
+`engine.generate_many([...])` batches requests built with
+`engine.make_request(...)`. [Runnable examples](../examples/)

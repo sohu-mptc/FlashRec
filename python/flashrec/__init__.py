@@ -1,20 +1,29 @@
-"""Standalone GenRec beam engine (mini-sglang layout, no sglang import)."""
+"""Serving runtime for catalog-constrained wide-beam search."""
 
 from typing import TYPE_CHECKING
 
 from flashrec.version import __git_commit__, __version__
 
 if TYPE_CHECKING:
-    from flashrec.config import BeamRecConfig
-    from flashrec.scheduler.scheduler import BeamRecEngine
+    from flashrec.config import BeamRecConfig, FlashRecConfig
+    from flashrec.scheduler.scheduler import BeamRecEngine, FlashRecEngine
 
-__all__ = ["BeamRecConfig", "BeamRecEngine", "__git_commit__", "__version__"]
+__all__ = [
+    "FlashRecConfig",
+    "FlashRecEngine",
+    "BeamRecConfig",
+    "BeamRecEngine",
+    "__git_commit__",
+    "__version__",
+]
 
 # Resolved on first attribute access rather than at import time: pulling the
 # engine in eagerly would drag torch and numpy into `import flashrec`,
 # which breaks reading __version__ and running check_env on exactly the
 # half-installed environments those two exist to diagnose.
 _LAZY = {
+    "FlashRecConfig": "flashrec.config",
+    "FlashRecEngine": "flashrec.scheduler.scheduler",
     "BeamRecConfig": "flashrec.config",
     "BeamRecEngine": "flashrec.scheduler.scheduler",
 }

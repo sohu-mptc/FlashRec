@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from flashrec.config import BeamRecConfig, same_sid_ids
+from flashrec.config import FlashRecConfig, same_sid_ids
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class SidLayout:
     boundary_tokens: str
 
 
-def resolve_sid_layout(config: BeamRecConfig) -> None:
+def resolve_sid_layout(config: FlashRecConfig) -> None:
     """Fill missing SID layout fields from the tokenizer + catalog.
 
     No-ops when the layout is already complete, or when no catalog is set
@@ -222,7 +222,7 @@ def _is_int(text: str) -> bool:
     return bool(text) and text.isdigit()
 
 
-def _fill(config: BeamRecConfig, name: str, inferred: str) -> None:
+def _fill(config: FlashRecConfig, name: str, inferred: str) -> None:
     current = getattr(config, name)
     if current is None:
         setattr(config, name, inferred)

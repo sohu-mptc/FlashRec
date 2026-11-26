@@ -9,6 +9,7 @@ Install, quickstart, and the feature overview are in the
 
 | | |
 | --- | --- |
+| **[Paper (PDF)](papers/paper.pdf)** | FlashRec: Serving Generative Recommendation with Catalog-Constrained Wide-Beam Search |
 | **[Architecture](architecture.md)** | Module layout and request path |
 | **[API](api.md)** | HTTP endpoints, response shape, Python interface |
 | **[Configuration](configuration.md)** | Flags and environment variables |

@@ -1,3 +1,3 @@
-from flashrec.server.api import BeamRecServer, serve
+from flashrec.server.api import BeamRecServer, FlashRecServer, serve
 
-__all__ = ["BeamRecServer", "serve"]
+__all__ = ["FlashRecServer", "BeamRecServer", "serve"]

@@ -47,8 +47,10 @@ class TestLazyImport:
         )
 
     def test_lazy_attrs_resolve(self):
-        assert flashrec.BeamRecConfig.__name__ == "BeamRecConfig"
-        assert flashrec.BeamRecEngine.__name__ == "BeamRecEngine"
+        assert flashrec.FlashRecConfig.__name__ == "FlashRecConfig"
+        assert flashrec.FlashRecEngine.__name__ == "FlashRecEngine"
+        assert flashrec.BeamRecConfig is flashrec.FlashRecConfig
+        assert flashrec.BeamRecEngine is flashrec.FlashRecEngine
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):

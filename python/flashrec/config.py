@@ -104,7 +104,7 @@ def same_sid_ids(
 
 
 @dataclass
-class BeamRecConfig:
+class FlashRecConfig:
     model_path: str
     mem_fraction_static: float = 0.8
     # "fp8" (W8A8 per-channel). "nvfp4" is reserved for an official checkpoint.
@@ -163,18 +163,12 @@ class BeamRecConfig:
     enable_restricted_lm_head: bool = True
     enable_fused_expand: bool = True
     enable_graph_expand: bool = True
-    # Skip the last GPU decode when every remaining trie path has out-degree 1
-    # (RecIF 4-level ``sid_end``). Forced tokens add 0 to cum_logprobs.
+    # Unary finish skips GPU decode for forced trie suffixes. Each appended
+    # token contributes zero to the cumulative log probability.
     enable_unary_finish: bool = True
-    # Opt-in legal-set scorer. Log-softmax over each parent's trie neighbors
-    # only. Within one parent the token order matches full-codebook
-    # softmax-then-mask; across parents the two subtract different constants,
-    # so the surviving beam changes. On OneRec-1.7B BF16 (5000 paired
-    # requests, 2026-10-20) the legal-set path is 0.00327 servable-recall@32
-    # below full-codebook at beam 200 / c=8, and the QPS at beam 50 and 200
-    # does not improve. Full-codebook is the default because it is the
-    # constrained beam search the model was trained under. Turn this on only
-    # to match an HF ``renormalize=True`` reference.
+    # FR-legal normalizes over each parent's legal trie children. The default
+    # FR-full normalizes over the current SID codebook before catalog masking.
+    # The different normalizers can change the ranking across parents.
     enable_sparse_lm_head: bool = False
     sparse_max_outdeg: int = 256
     # Fused CUDA scorer for the sparse path: reads lm_head rows in place rather
@@ -204,10 +198,8 @@ class BeamRecConfig:
     enable_prefill_batch: bool = True
     enable_warmup: bool = True
     enable_decode_pack: bool = True
-    # Cascade decode attention: read each request's shared prompt KV once per
-    # decode step instead of once per beam row (FlashInfer multi-level
-    # cascade). Measured on the attention kernel: ~3-4x at beam>=128 with
-    # prompt>=500 tokens, ~2x at beam=50/prompt=1000, slower below ~50 rows.
+    # Beam-shared attention (BSA) reuses prompt KV reads across beam rows
+    # through FlashInfer multi-level cascade attention.
     # When enabled, decode tries a dedicated cascade CUDA graph (padded
     # MultiLevelCascade wrapper); missing/oversized batches stay on eager
     # cascade. cascade_min_rows gates per batch: batches with fewer total
@@ -397,3 +389,6 @@ class BeamRecConfig:
             if path.is_file():
                 return path.read_text(encoding="utf-8").strip()
         return None
+
+
+BeamRecConfig = FlashRecConfig

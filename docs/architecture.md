@@ -1,9 +1,8 @@
 # Architecture
 
-FlashRec serves an HTTP request in the same process that owns the weights and
-the KV pool. The request is admitted into a decode wave and executed there.
-Scheduling and tokenization run as threads inside that process, sharing one
-address space.
+FlashRec serves generative recommendation with catalog-constrained wide-beam
+search. Its HTTP server, model and KV pool share a process. Host threads handle
+scheduling and tokenization while search state stays on the GPU.
 
 The module layout follows
 [mini-sglang](https://github.com/sgl-project/mini-sglang). At runtime the engine
@@ -29,9 +28,9 @@ that index an item catalog. The shape differs from chat serving.
 
 | | Chat / general LLM | GenRec beam retrieval |
 | --- | --- | --- |
-| Decode depth | hundreds to thousands of steps | 3–5 steps |
-| Width per request | 1 sequence | 50–512+ beams |
-| Vocabulary per step | full, unconstrained | only valid-SID continuations |
+| Decode depth | hundreds to thousands of steps | typically 3–4 SID tokens |
+| Width per request | 1 sequence | up to 1,000 beams in the paper |
+| Valid continuations | full vocabulary | legal children in the catalog trie |
 | Dominant cost | attention over long context | beam bookkeeping and expansion |
 
 A general-purpose engine amortizes per-step overhead over a long decode. Over
@@ -41,40 +40,48 @@ engine.
 
 ## Request path
 
-1. **Admission.** Requests wait until the beam-row slot budget can hold them.
-   The queue is longest-prefix-match by default, with aging so a request behind
-   better-matching neighbours keeps gaining priority until it is admitted.
+1. **Beam-row admission.** By default, each request charges its requested beam
+   width against the row budget. The queue uses longest-prefix match with aging.
 2. **Tokenize.** Host worker threads, off the GPU critical path.
 3. **Radix prefix match.** Shared prompt prefixes reuse cached KV; the hit shows
    up as `usage.prompt_tokens_details.cached_tokens`.
-4. **Batched prefill.** All requests admitted into the wave prefill together.
-5. **Trie-constrained expand.** At engine start the SID layout is inferred from
-   the tokenizer (`<s_a_0>` codebooks, `<|sid_begin|>` / `<|sid_end|>`) plus
-   `--sid-vocab-file`. A fused CUDA kernel then scores continuations against
-   the SID trie, so illegal SIDs are never candidates and `invalid_rate` is
-   0. `lm_head` is evaluated only over that inferred token range.
-6. **Decode.** One CUDA-graph replay per step, covering the full beam width
-   including the expansion step. Steps 5–6 repeat until the SID is complete.
-7. **Finalize.** Length penalty, ranking, and the OpenAI-shaped response.
+4. **Shared prefill.** Batched prefill computes each prompt once and shares its
+   prompt KV page references across that request's beams.
+5. **GPU-resident expansion.** At startup, FlashRec infers the SID layout from
+   the tokenizer and `--sid-vocab-file`. The search masks illegal trie edges and
+   selects the surviving parent-token pairs for each request. Eligible shapes
+   fuse selection and state advancement in CUDA.
+6. **Zero-copy state and KV inheritance.** One parent map advances SID histories
+   and trie nodes and remaps the generated-suffix KV references without copying
+   KV tensors. The next forward pass writes newly selected tokens to fresh KV
+   slots. Eligible shapes replay CUDA graphs over persistent device buffers.
+7. **Finalize.** FlashRec applies the length penalty, ranks the complete SIDs,
+   releases the request's row charge and decode pages, and returns the response.
 
 ## Design
 
-**Beam expansion lives inside the CUDA graph.** Graph capture sizes extend to
-multiples of the configured beam width, so a wide beam replays as a single graph.
+**CUDA graph replay.** Eligible model, SID head and expansion paths replay a
+per-level graph. Other shapes can use a base graph with separate expansion or
+run eagerly.
 
-**The trie is the decoding constraint.** Dense for small catalogs, CSR sparse for
-large ones (a public 8192³ catalog would need ~25G dense cells). Constraining
-during expansion keeps `invalid_rate = 0` while open-vocabulary baselines leave
-roughly 17–27% of beams illegal.
+**Catalog trie and scoring.** Small catalogs use dense transition tables and
+larger catalogs use compressed sparse row (CSR) adjacency. Full-codebook
+scoring (FR-full) normalizes over the current SID level's codebook before trie
+masking. Legal-set scoring (FR-legal) normalizes over each prefix's legal
+children. With deterministic trie decoding, unary finish can append the forced
+suffix without model calls once all live beams have unique remaining paths.
+
+**Beam-shared attention (BSA).** The optional FlashInfer path reuses each
+request's prompt KV reads across beams and computes attention over each beam's
+generated suffix. The per-level graph takes precedence when eligible. Use
+`--disable-level-graph` to exercise BSA in batches that would otherwise use
+that graph. [Configuration](configuration.md#memory--backends)
 
 **FP8 reduces footprint.** W8A8 per-channel weights and `fp8_e4m3` KV by default,
 with fused RMSNorm→FP8, SiLU→FP8, and QK-RoPE+KV-write kernels. On 1.7B-class
 checkpoints at `n ≤ 128` it runs ~0.6–0.9× the throughput of BF16 and returns
 weight and KV-cache room; the two precisions converge at `n = 512`, where the
 step is bound by bookkeeping.
-
-**Scheduling is throughput-oriented.** Requests are admitted between decode steps
-under a slot budget, which lets beam rows from different requests share a step.
 
 ## Scope
 

@@ -111,20 +111,25 @@ class TestBeamRecConfigSid:
         cfg = BeamRecConfig(model_path="/tmp/model")
         assert cfg.enable_sparse_lm_head is False
 
-    def test_cli_sparse_lm_head_is_opt_in(self):
+    @pytest.mark.parametrize(
+        ("legal_flag", "full_flag"),
+        [
+            ("--legal-set-scoring", "--full-codebook-scoring"),
+            ("--enable-sparse-lm-head", "--disable-sparse-lm-head"),
+        ],
+    )
+    def test_cli_legal_set_scoring_is_opt_in(self, legal_flag, full_flag):
         from flashrec.cli import _build_parser, config_from_args
 
         parser = _build_parser()
         off = config_from_args(parser.parse_args(["--model-path", "/tmp/model"]))
         assert off.enable_sparse_lm_head is False
         forced_off = config_from_args(
-            parser.parse_args(
-                ["--model-path", "/tmp/model", "--disable-sparse-lm-head"]
-            )
+            parser.parse_args(["--model-path", "/tmp/model", full_flag])
         )
         assert forced_off.enable_sparse_lm_head is False
         on = config_from_args(
-            parser.parse_args(["--model-path", "/tmp/model", "--enable-sparse-lm-head"])
+            parser.parse_args(["--model-path", "/tmp/model", legal_flag])
         )
         assert on.enable_sparse_lm_head is True
         with pytest.raises(ValueError, match="only one"):
@@ -133,11 +138,28 @@ class TestBeamRecConfigSid:
                     [
                         "--model-path",
                         "/tmp/model",
-                        "--enable-sparse-lm-head",
-                        "--disable-sparse-lm-head",
+                        legal_flag,
+                        full_flag,
                     ]
                 )
             )
+
+    @pytest.mark.parametrize(
+        ("enable_flag", "rows_flag"),
+        [
+            ("--enable-beam-shared-attention", "--beam-shared-attention-min-rows"),
+            ("--enable-cascade-attention", "--cascade-min-rows"),
+        ],
+    )
+    def test_cli_beam_shared_attention(self, enable_flag, rows_flag):
+        from flashrec.cli import _build_parser, config_from_args
+
+        args = _build_parser().parse_args(
+            ["--model-path", "/tmp/model", enable_flag, rows_flag, "64"]
+        )
+        config = config_from_args(args)
+        assert config.enable_cascade_attention
+        assert config.cascade_min_rows == 64
 
     def test_admission_unit_is_normalized(self):
         cfg = BeamRecConfig(model_path="/tmp/model", admission_unit="REQUEST")

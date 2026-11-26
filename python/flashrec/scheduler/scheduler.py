@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from flashrec.config import BeamRecConfig
+from flashrec.config import FlashRecConfig
 from flashrec.core import (
     BeamRequest,
     BeamResult,
@@ -77,8 +77,8 @@ class _DecodeLaunch:
     fused: Optional[GenrecFusedResult] = None
 
 
-class BeamRecEngine:
-    def __init__(self, config: BeamRecConfig):
+class FlashRecEngine:
+    def __init__(self, config: FlashRecConfig):
         self.config = config
         self.path_stats: Dict[str, float] = {
             "prefill_batches": 0,
@@ -2922,3 +2922,6 @@ class BeamRecEngine:
             else:
                 self.runner.free_req_slots(req.beam_pool_indices)
             req.beam_pool_indices = None
+
+
+BeamRecEngine = FlashRecEngine
