@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-26
+
+Added cascade attention, CSR trie operators, deadline-aware SLO admission,
+and decode/memory optimizations.
+
+### Added
+
+- Cascade attention with FlashInfer prefix sharing and CUDA-graph
+  capture/replay (`attention/flashinfer.py`, `engine/graph.py`,
+  `scheduler/scheduler.py`).
+- Standard CSR trie CUDA operators (`kernel/csr_trie.py`,
+  `kernel/csrc/csr_trie.cuh`) to replace dense transition tables in trie
+  mode, significantly reducing resident trie index VRAM while preserving
+  output semantics and throughput.
+- Trie-budget grouped beam expansion, unary finish, and leaf flush
+  (`search/budget.py`, `search/unary.py`, `kernel/trie_budget.py`,
+  `kernel/csrc/trie_budget.cuh`).
+- Deadline-aware SLO admission gate (`--admission-slo-budget-ms`,
+  `--admission-unit`, `--max-queue-len`, and affine service-time estimator
+  flags), `token_ids` in chat responses, and scheduler admission/path
+  telemetry (`scheduler/loop.py`, `scheduler/batching.py`, `server/api.py`,
+  `cli.py`, `scripts/serve.sh`).
+- Configurable `qk_norm` override for Qwen2/Qwen3 checkpoints, optional
+  next-norm fusion, and explicit SID boundary token support.
+
+### Changed
+
+- Default `enable_sparse_lm_head` to `False` (full-codebook scoring);
+  legal-set renormalized scoring remains opt-in via
+  `--enable-sparse-lm-head`.
+- Trigger full idle GC only after sustained worker inactivity
+  (`server/api.py`, `cli.py`, `config.py`).
+- Size `ReqToTokenPool` from slot and batch-request budgets and keep
+  evicting unlocked radix cache entries until KV allocation succeeds.
+
+### Fixed
+
+- Run unary and leaf finish paths under `torch.inference_mode()` during
+  decode ticks to avoid in-place inference-tensor update errors.
+- Prevent beam padding from emitting illegal SIDs when legal trie children
+  run out, and size cascade CUDA-graph metadata to the live beam width.
+- Fix an undefined `device` reference in `Qwen3ForCausalLM._wire_next_norm()`.
+
 ## [0.1.2] - 2026-09-12
 
 Fixed within-request SID collapse under CUDA-graph decode.
@@ -74,7 +117,8 @@ wide beam search over a semantic-ID catalog, executed inside CUDA graphs.
 - CPU unit tests, pre-commit hooks, GitHub Actions CI, and a PyPI release
   workflow on `v*` tags.
 
-[Unreleased]: https://github.com/sohu-mptc/FlashRec/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/sohu-mptc/FlashRec/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.3
 [0.1.2]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.2
 [0.1.1]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sohu-mptc/FlashRec/releases/tag/v0.1.0
