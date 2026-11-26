@@ -28,7 +28,7 @@ class TestGatherAndPool:
         from flashrec.engine.staging import PinnedStage
 
         st = PinnedStage()
-        dest = torch.empty(8, dtype=torch.int64, pin_memory=True)
+        dest = torch.empty(8, dtype=torch.int64, pin_memory=torch.cuda.is_available())
         dest.fill_(-1)
         gpu, pin = st.copy_list(
             "seq_cpu", [3, 1, 4], torch.device("cpu"), torch.int64, dest=dest[:3]

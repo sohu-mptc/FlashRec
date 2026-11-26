@@ -239,7 +239,9 @@ def convert_jobs(
         if not src.is_file():
             raise FileNotFoundError(f"missing RecIF mapping: {src}")
         sids, n_in, bad, packed_only = load_unique_sids(src, base=base)
-        resolved = infer_levels(sids, packed_only=packed_only) if levels is None else levels
+        resolved = (
+            infer_levels(sids, packed_only=packed_only) if levels is None else levels
+        )
         if resolved < 1:
             raise ValueError(f"catalog levels must be >= 1, got {resolved}")
         unique = sorted({normalize_sid(codes, levels=resolved) for codes in sids})
@@ -278,7 +280,9 @@ def run_catalog(
             return 0
         if path.is_file():
             if out is None:
-                out_tmpl = str(DEFAULT_OUT_DIR / f"{path.stem}_beamrec_l{{levels}}.json")
+                out_tmpl = str(
+                    DEFAULT_OUT_DIR / f"{path.stem}_beamrec_l{{levels}}.json"
+                )
                 convert_jobs([(path, None, out_tmpl)], levels=levels, base=base)
             elif out.suffix.lower() == ".json":
                 convert_jobs([(path, out, None)], levels=levels, base=base)

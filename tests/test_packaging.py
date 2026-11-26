@@ -20,6 +20,8 @@ HEAVY = ("torch", "numpy", "transformers")
 
 def _in_subprocess(code):
     """Run code in a fresh interpreter so this suite's own imports don't leak."""
+    source_path = str(ROOT / "python")
+    code = f"import sys\nsys.path.insert(0, {source_path!r})\n{code}"
     out = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
