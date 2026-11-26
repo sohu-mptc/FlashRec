@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aligned the CLI and documentation with the paper's terminology. The Python
   API now uses `FlashRecConfig`, `FlashRecEngine`, and `FlashRecServer`.
   Existing `BeamRec*` imports and server launch commands remain compatible.
+- Use per-depth trie bounds to skip impossible unary finishes and reduce
+  finish checks over each request's live beam rows.
+
+### Fixed
+
+- Wait for prefill and prior decode work before checking whether a request
+  can finish through a forced suffix or leaf flush.
 
 ## [0.1.3] - 2026-11-26
 

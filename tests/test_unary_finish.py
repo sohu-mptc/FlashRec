@@ -2,6 +2,7 @@ import torch
 
 from flashrec.config import BeamRecConfig
 from flashrec.core import BeamRequest
+from flashrec.scheduler.pipeline import DecodePipeline
 from flashrec.scheduler.scheduler import BeamRecEngine
 from flashrec.search.state import BeamSearchList
 from flashrec.search.trie import BeamValidPathTrie
@@ -124,20 +125,88 @@ class TestUnaryFinish:
         class _Eng:
             config = BeamRecConfig(model_path="x", enable_unary_finish=True)
             valid_path = trie
-            forwarded = False
+            pipeline = DecodePipeline(enabled=False)
+            checks = 0
+
+            _decode_one_step = BeamRecEngine._decode_one_step
+
+            def _wait_pipe_ready(self, pipe_id):
+                assert pipe_id is None
 
             def generation_token_limit(self, n):
                 return int(n)
 
             def _unary_finish_live(self, reqs):
+                self.checks += 1
                 return BeamRecEngine._unary_finish_live(self, reqs)
 
         eng = _Eng()
-        leftover = BeamRecEngine._unary_finish_live(eng, [req])
-        assert leftover == []
-        assert req.finished
         BeamRecEngine._decode_tick(eng, [req])
-        assert not eng.forwarded
+        assert req.finished
+        assert eng.checks == 1
+
+    def test_scheduler_skips_impossible_depth(self, monkeypatch):
+        trie = _bushy_last_trie()
+        req = _request(trie, [[10]], max_new=2)
+
+        def unexpected_lookup(*args):
+            raise AssertionError("branching depth should skip device tables")
+
+        monkeypatch.setattr(trie, "ensure_unary_tables", unexpected_lookup)
+
+        class _Eng:
+            config = BeamRecConfig(model_path="x")
+            valid_path = trie
+
+            def generation_token_limit(self, n):
+                return int(n)
+
+        assert BeamRecEngine._unary_finish_live(_Eng(), [req]) == [req]
+
+    def test_scheduler_reduces_ragged_frontiers_independently(self):
+        trie = _sid_end_trie()
+        hit = _request(trie, [[10]], max_new=3)
+        miss = _request(trie, [[10, 20], [11, 20]], max_new=3)
+        miss.beam_list.node_ids[1] = trie._invalid_node
+
+        class _Eng:
+            config = BeamRecConfig(model_path="x")
+            valid_path = trie
+
+            def generation_token_limit(self, n):
+                return int(n)
+
+        assert BeamRecEngine._unary_finish_live(_Eng(), [miss, hit]) == [miss]
+        assert hit.finished
+        assert hit.beam_list.token_ids.tolist() == [[10, 20, 30]]
+
+    def test_pipeline_finishes_after_waiting_for_frontier(self):
+        trie = _sid_end_trie()
+        with torch.inference_mode():
+            req = _request(trie, [[10, 20]], max_new=3)
+        prefill_done = object()
+        req.prefill_done = prefill_done
+        waits = []
+
+        class _Eng:
+            config = BeamRecConfig(model_path="x")
+            valid_path = trie
+            _unary_finish_live = BeamRecEngine._unary_finish_live
+
+            def generation_token_limit(self, n):
+                assert waits == [1, prefill_done]
+                return int(n)
+
+            def _wait_pipe_ready(self, pipe_id):
+                waits.append(pipe_id)
+
+            def _wait_event(self, event):
+                waits.append(event)
+
+        assert BeamRecEngine._launch_pipe_forward(_Eng(), [req], 1) is None
+        assert req.prefill_done is None
+        assert req.finished
+        assert req.beam_list.token_ids.tolist() == [[10, 20, 30]]
 
 
 class TestUnaryFinishDisabled:

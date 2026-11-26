@@ -1811,17 +1811,14 @@ class FlashRecEngine:
 
     def _decode_tick(self, reqs: List[BeamRequest]) -> None:
         """One scheduler tick: process prior pipe result, launch one pipe (or serial)."""
-        # token_ids are inference tensors created under inference_mode in the
-        # decode forward; the unary/leaf finish writes them in place, so it must
-        # run in inference mode too (otherwise RuntimeError on every request).
-        with torch.inference_mode():
-            live = self._unary_finish_live([r for r in reqs if not r.finished])
+        live = [r for r in reqs if not r.finished]
         if not live:
             return
         pipe = self.pipeline
         is_fin = lambda r: bool(r.finished)
         if pipe.enabled and (pipe.active or len(live) >= 2):
             if not pipe.active:
+                self._wait_pipe_ready(None)
                 pipe.try_materialize(live, is_fin)
             if pipe.active:
                 pipe.sync_pipes_from_running(live, is_fin)
@@ -1849,14 +1846,9 @@ class FlashRecEngine:
             return
         pipe.enqueue(pipe.current_pipe_id, launch)
 
+    @torch.inference_mode()
     def _unary_finish_live(self, reqs: List[BeamRequest]) -> List[BeamRequest]:
-        """Finish trailing-unary / small-leaf requests. Return those that still need decode.
-
-        Both gates (forced-unary suffix, leaf flush) are evaluated for every
-        request in one batched reduction and one DtoH sync per tick. The
-        per-request form cost up to ``2 * remain + 1`` ``.item()`` stalls per
-        request per step even when neither gate ever fired.
-        """
+        """Finish eligible requests in place before decode and return the rest."""
         enabled = bool(getattr(self.config, "enable_unary_finish", True))
         flush_leaves = int(getattr(self.config, "trie_flush_leaves", 0) or 0)
         vp = self.valid_path
@@ -1864,104 +1856,84 @@ class FlashRecEngine:
         use_leaf = flush_leaves > 0 and trie_ok
         use_unary = enabled and trie_ok
 
-        gates: dict = {}
-        cand: List[Tuple[BeamRequest, torch.Tensor, int]] = []
-        if use_unary or use_leaf:
-            for req in reqs:
-                if req.finished:
-                    continue
-                if float(getattr(req, "temperature", 0.0) or 0.0) > 0.0:
-                    continue
-                bl = getattr(req, "beam_list", None)
-                if bl is None or bl.node_ids is None or bl.token_ids is None:
-                    continue
-                if int(bl.node_ids.numel()) == 0:
-                    # Vacuous all() would pass the gates; can_unary_finish
-                    # treats an empty frontier as not finishable.
-                    continue
-                remain = self.generation_token_limit(req.max_new_tokens) - int(
-                    bl.generated_len()
-                )
-                cand.append((req, bl.node_ids, remain))
-        if cand:
-            device = cand[0][1].device
-            sfx = None
-            lc_t = None
-            if vp.ensure_unary_tables(device):
-                sfx = getattr(vp, "_unary_suffix_len", None) if use_unary else None
-                lc_t = vp._leaf_count if use_leaf else None
-            if sfx is not None or lc_t is not None:
-                sizes = torch.tensor(
-                    [int(nodes.numel()) for _, nodes, _ in cand], dtype=torch.int64
-                ).to(device)
-                flat = torch.cat([nodes.reshape(-1) for _, nodes, _ in cand]).to(
-                    dtype=torch.int64
-                )
-                n_nodes = int(vp._outdeg.shape[0])
-                valid = (flat >= 0) & (flat < n_nodes)
-                safe = flat.clamp(0, max(n_nodes - 1, 0))
-                req_idx = torch.repeat_interleave(
-                    torch.arange(len(cand), device=device), sizes
-                )
-                flags = []
-                if sfx is not None:
-                    remains = torch.tensor(
-                        [max(int(r), 0) for _, _, r in cand], dtype=torch.int32
-                    ).to(device)[req_idx]
-                    unary_row = valid & (sfx.to(device=device)[safe] >= remains)
-                    flags.append(unary_row)
-                if lc_t is not None:
-                    leaf_row = valid & (lc_t.to(device=device)[safe] <= flush_leaves)
-                    flags.append(leaf_row)
-                acc = torch.ones(
-                    (len(flags), len(cand)), dtype=torch.int8, device=device
-                )
-                for j, row in enumerate(flags):
-                    acc[j].scatter_reduce_(
-                        0, req_idx, row.to(dtype=torch.int8), reduce="amin"
-                    )
-                acc_cpu = acc.cpu().tolist()
-                j = 0
-                unary_ok = acc_cpu[j] if sfx is not None else None
-                if sfx is not None:
-                    j += 1
-                leaf_ok = acc_cpu[j] if lc_t is not None else None
-                for i, (req, _, remain) in enumerate(cand):
-                    u_ok = unary_ok is not None and bool(unary_ok[i]) and remain > 0
-                    l_ok = leaf_ok is not None and bool(leaf_ok[i])
-                    gates[id(req)] = (u_ok, l_ok)
+        if not (use_unary or use_leaf):
+            return [req for req in reqs if not req.finished]
 
-        leftover: List[BeamRequest] = []
+        suffix_bounds = getattr(vp, "_max_unary_suffix_len_by_depth", None)
+        candidates = []
         for req in reqs:
-            if req.finished:
+            if req.finished or req.temperature > 0.0:
                 continue
+            bl = req.beam_list
+            if bl is None or bl.node_ids is None or bl.token_ids is None:
+                continue
+            if not bl.node_ids.numel():
+                continue
+            depth = bl.generated_len()
             limit = self.generation_token_limit(req.max_new_tokens)
-            g = gates.get(id(req))
-            if enabled and try_unary_finish_request(
-                req, self.valid_path, limit, gate=(g[0] if g is not None else None)
-            ):
-                continue
-            if use_leaf and g is not None and g[1]:
-                # try_leaf_flush re-checks the gate (one sync) but only runs on
-                # the rare firing path; the steady-state cost is the batch above.
-                if try_leaf_flush(req, self.valid_path, limit, flush_leaves):
+            remain = limit - depth
+            unary = use_unary and remain > 0
+            if unary and suffix_bounds is not None and 0 <= depth < len(suffix_bounds):
+                # Valid frontier IDs represent prefixes of the generated length.
+                unary = remain <= suffix_bounds[depth]
+            leaf = use_leaf and remain >= 2
+            if unary or leaf:
+                candidates.append(
+                    (req, bl.node_ids.reshape(-1), limit, remain, unary, leaf)
+                )
+
+        if not candidates or not vp.ensure_unary_tables(candidates[0][1].device):
+            return [req for req in reqs if not req.finished]
+
+        suffix = vp._unary_suffix_len if any(c[4] for c in candidates) else None
+        leaves = vp._leaf_count if any(c[5] for c in candidates) else None
+        min_suffix = leaf_ok = None
+        if suffix is not None or leaves is not None:
+            widths = [nodes.numel() for _, nodes, *_ in candidates]
+            nodes = torch.cat([nodes for _, nodes, *_ in candidates]).to(torch.int64)
+            safe = nodes.clamp(0, vp._outdeg.numel() - 1)
+            valid = nodes == safe
+            checks = []
+            if suffix is not None:
+                checks.append(suffix[safe].masked_fill_(~valid, 0))
+            if leaves is not None:
+                checks.append((valid & (leaves[safe] <= flush_leaves)).to(torch.int32))
+            rows = torch.stack(checks) if len(checks) > 1 else checks[0].unsqueeze(0)
+            # Widths are known on the host. Reduce contiguous rows without
+            # uploading segment IDs or deriving an output shape on the GPU.
+            if min(widths) == max(widths):
+                reduced = rows.view(len(checks), len(widths), widths[0]).amin(dim=2)
+            else:
+                reduced = torch.stack(
+                    [part.amin(dim=1) for part in rows.split(widths, dim=1)], dim=1
+                )
+            host = reduced.cpu().tolist()
+            min_suffix = host[0] if suffix is not None else None
+            leaf_ok = host[-1] if leaves is not None else None
+
+        for i, (req, _, limit, remain, unary, leaf) in enumerate(candidates):
+            if unary and (min_suffix is None or min_suffix[i] >= remain):
+                if try_unary_finish_request(
+                    req, vp, limit, gate=True if min_suffix is not None else None
+                ):
                     continue
-            leftover.append(req)
-        return leftover
+            if leaf and leaf_ok is not None and leaf_ok[i]:
+                try_leaf_flush(req, vp, limit, flush_leaves)
+        return [req for req in reqs if not req.finished]
 
     def _launch_pipe_forward(
         self, reqs: List[BeamRequest], pipe_id: Optional[int]
     ) -> Optional[_DecodeLaunch]:
-        self._wait_pipe_ready(pipe_id, pop=True)
-        live = self._unary_finish_live([r for r in reqs if not r.finished])
-        if not live:
-            return None
-        ordered, _ = self._ordered_live(live)
-        for req in ordered:
+        self._wait_pipe_ready(pipe_id)
+        for req in reqs:
             ev = getattr(req, "prefill_done", None)
             if ev is not None:
                 self._wait_event(ev)
                 req.prefill_done = None
+        live = self._unary_finish_live(reqs)
+        if not live:
+            return None
+        ordered, _ = self._ordered_live(live)
         with trace_range(f"flashrec.pipe_fwd pipe={pipe_id} reqs={len(ordered)}"):
             logprobs, cands, fused = self._forward_decode(ordered)
         replay_done = None
@@ -2063,14 +2035,14 @@ class FlashRecEngine:
 
     def _decode_one_step(self, reqs: List[BeamRequest]) -> None:
         """Serial decode: one forward over all live reqs (conc=1 / pipeline off)."""
-        live = self._unary_finish_live([r for r in reqs if not r.finished])
+        self._wait_pipe_ready(None)
+        live = self._unary_finish_live(reqs)
         if not live:
             return
         ordered, groups = self._ordered_live(live)
         with trace_range(
             f"flashrec.decode_step reqs={len(ordered)} groups={len(groups)}"
         ):
-            self._wait_pipe_ready(None, pop=True)
             logprobs, cands, fused = self._forward_decode(ordered)
             replay_done = None
             if torch.cuda.is_available():

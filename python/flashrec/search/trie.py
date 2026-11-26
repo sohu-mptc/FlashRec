@@ -115,6 +115,9 @@ class BeamValidPathTrie:
     _unary_suffix_len: Optional[torch.Tensor] = field(
         default=None, repr=False
     )  # [N] int32
+    _max_unary_suffix_len_by_depth: Optional[List[int]] = field(
+        default=None, repr=False
+    )
     _edge_rowptr: Optional[torch.Tensor] = field(
         default=None, repr=False
     )  # [N+1] int32
@@ -227,6 +230,7 @@ class BeamValidPathTrie:
             self._unary_child = None
             self._leaf_count = None
             self._unary_suffix_len = None
+            self._max_unary_suffix_len_by_depth = None
             self._edge_rowptr = None
             self._edge_token = None
             self._edge_child = None
@@ -248,6 +252,7 @@ class BeamValidPathTrie:
             self._unary_child = None
             self._leaf_count = None
             self._unary_suffix_len = None
+            self._max_unary_suffix_len_by_depth = None
             self._edge_rowptr = None
             self._edge_token = None
             self._edge_child = None
@@ -339,11 +344,14 @@ class BeamValidPathTrie:
         # init_from_prefill, so sizing a decode plane from the global maximum
         # pads every row to a width no decode node can reach.
         by_depth: List[int] = [0] * (max_depth + 1)
+        suffix_by_depth: List[int] = [0] * (max_depth + 1)
         for nid in range(n_nodes):
             d = len(inv[nid])
-            if d < len(by_depth) and deg[nid] > by_depth[d]:
-                by_depth[d] = deg[nid]
+            if d < len(by_depth):
+                by_depth[d] = max(by_depth[d], deg[nid])
+                suffix_by_depth[d] = max(suffix_by_depth[d], sfx[nid])
         self._max_outdeg_by_depth = by_depth
+        self._max_unary_suffix_len_by_depth = suffix_by_depth
 
     def ensure_unary_tables(self, device: Optional[torch.device] = None) -> bool:
         """Build unary tables if needed and optionally move them to ``device``."""
